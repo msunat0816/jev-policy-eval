@@ -1,0 +1,84 @@
+name: Verify JEV window selection
+on:
+  push:
+    branches: [codex/verify-jev-windows]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install CPU dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg python3-opencv
+      - name: Check window routing and scoring
+        shell: bash
+        run: |
+          /usr/bin/python3 - <<'PY'
+          import json
+          import tempfile
+          from pathlib import Path
+          from unittest.mock import patch
+          import evaluate_rollout as ev
+          windows = [(0, 5), (5, 10)]
+          obs = {"frames": [{"frame": t, "boxes": {}} for t in (0, 5, 10)],
+                 "requirements": [{"text": "check object position"}]}
+          for first, last, expected in [("p2", "p1", [[0, 5]]), ("p0", "p2", [[5, 10]]), ("p0", "p1", [])]:
+              routes = {"w0": first, "w1": last, "w0r0": "none", "w1r0": "none"}
+              decisions, evidence = ev.collect(None, obs, windows, routes, list(range(11)), (80, 60))
+              assert [r["frames"] for r in evidence] == expected
+          with tempfile.TemporaryDirectory() as tmp:
+              path = Path(tmp) / "03-evidence.json"
+              for statuses, expected in [([], None), (["supported"], 5), (["supported", "contradicted"], None), (["supported", "unknown"], None)]:
+                  records = [{"requirement": 0, "frames": windows[i], "status": s, "terminal_window": i == 1}
+                             for i, s in enumerate(statuses)]
+                  path.write_text(json.dumps({"task": "check object position", "requirements": obs["requirements"],
+                                              "windows": decisions, "evidence": records}))
+                  with patch.object(ev, "ask_jev", return_value={"grade": "level_5"}):
+                      assert ev.score_saved(path)["score"] == expected
+          print("Routing and evidence guards passed.")
+          PY
+      - name: Decode a pinned RoboRewardBench test video
+        run: |
+          curl --fail --silent --show-error --location --retry 2 --max-time 90 -o "$RUNNER_TEMP/sample.mp4" 'https://huggingface.co/datasets/teetone/RoboReward/resolve/d69d5b92b8f3caee9a616b615b300bdf0d37aef2/test/austin_sirius_dataset_converted_externally_to_rlds/austin_sirius_dataset_converted_externally_to_rlds_originalsplit_train_index_527.mp4'
+          /usr/bin/python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import cv2
+          import evaluate_rollout as ev
+          path = Path(os.environ["RUNNER_TEMP"]) / "sample.mp4"
+          times = ev.frame_times(path)
+          cap = cv2.VideoCapture(str(path))
+          try:
+              assert len(times) > 1 and cap.read()[0]
+          finally:
+              cap.release()
+          print(f"RoboRewardBench sample decoded: {len(times)} frames.")
+          PY
+      - name: Evaluate sample if both model keys are configured
+        env:
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          DASHSCOPE_BASE_URL: ${{ vars.DASHSCOPE_BASE_URL }}
+        run: |
+          if [[ -z "$DASHSCOPE_API_KEY" || -z "$TYPESAFE_API_KEY" ]]; then
+            echo "Live scoring skipped. Both repository secrets DASHSCOPE_API_KEY and TYPESAFE_API_KEY are required." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope-intl.aliyuncs.com/compatible-mode/v1}"
+          /usr/bin/python3 evaluate_rollout.py --video "$RUNNER_TEMP/sample.mp4" \
+            --task 'Place the small beige block onto the left peg of the tray.' \
+            --episode 'austin_sirius_dataset_converted_externally_to_rlds_originalsplit_train_index_527' \
+            --split test --out sample-run
+          cat sample-run/result.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Save evaluation trace
+        if: ${{ always() && hashFiles('sample-run/run.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-trace
+          path: sample-run
