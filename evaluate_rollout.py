@@ -113,6 +113,7 @@ def evaluate(expert, predicate, rows, frame_size):
 
 QWEN = "qwen3.6-flash"
 JEV = "jev-1.14.0"
+DEFAULT_SAMPLE_INTERVAL_SECONDS = 2.0
 PRIORITY = {
     "p0": "No relevant change or open question.",
     "p1": "Relevant but redundant. Checking this interval adds no decisive evidence.",
@@ -202,6 +203,25 @@ def frame_times(video):
     if not times or not np.isfinite(times).all() or any(a > b for a, b in zip(times, times[1:])):
         raise ValueError("video has no usable ordered presentation timestamps")
     return times
+
+
+def overview_indices(times, interval_seconds):
+    """Pick the first frame in each occupied time bin and include the final frame."""
+    if not math.isfinite(interval_seconds) or interval_seconds < 0.000001:
+        raise ValueError("sample interval must be finite and at least one microsecond")
+    # ffprobe reports timestamps to microsecond precision. Integer bins avoid drift.
+    interval_us = round(interval_seconds * 1_000_000)
+    start_us = round(times[0] * 1_000_000)
+    selected = [0]
+    last_bin = 0
+    for index, timestamp in enumerate(times[1:-1], start=1):
+        bin_id = (round(timestamp * 1_000_000) - start_us) // interval_us
+        if bin_id > last_bin:
+            selected.append(index)
+            last_bin = bin_id
+    if len(times) > 1:
+        selected.append(len(times) - 1)
+    return selected
 
 
 def observe(task, indices, times, cap, folder):
@@ -323,11 +343,12 @@ def score_saved(path):
             "jev_choice": answer, "guard_reason": reason, "evidence_file": path.name}
 
 
-def run(args):
+def run(args, *, sample_interval_seconds=DEFAULT_SAMPLE_INTERVAL_SECONDS):
     started = time.monotonic()
     times = frame_times(args.video)
-    indices = np.unique(np.linspace(0, len(times)-1, min(8, len(times))).round().astype(int)).tolist()
+    indices = overview_indices(times, sample_interval_seconds)
     windows = list(zip(indices, indices[1:])) or [(0, 0)]
+    max_gap = max(times[last] - times[first] for first, last in windows)
     folder = args.out
     folder.mkdir(parents=True, exist_ok=False)
     cap = cv2.VideoCapture(str(args.video))
@@ -338,6 +359,8 @@ def run(args):
         save(folder / "run.json", {"dataset": "RoboReward", "split": args.split, "episode": args.episode,
              "task": args.task, "video": str(args.video.resolve()), "sha256": digest, "image_size": size,
              "frame_pts_seconds": times, "observed_indices": indices, "opencv": cv2.__version__,
+             "coarse_sampling": {"method": "fixed_interval_pts_v1", "interval_seconds": sample_interval_seconds,
+                                 "n_selected": len(indices), "max_actual_gap_seconds": max_gap},
              "qwen": QWEN, "jev": JEV, "expert_config": CONFIG, "window_threshold": 2,
              "protocol": "roboreward-end-state-v1; cpu-experts-v1; jev-threshold-all-windows-v1"})
         obs = observe(args.task, indices, times, cap, folder)
@@ -361,8 +384,11 @@ if __name__ == "__main__":
     parser.add_argument("--episode", required=True)
     parser.add_argument("--split", required=True, choices=["train", "validation", "test"])
     parser.add_argument("--out", type=Path, required=True, help="new run directory")
+    parser.add_argument("--sample-interval-seconds", type=float, default=DEFAULT_SAMPLE_INTERVAL_SECONDS,
+                        help="seconds between coarse time samples (default: 2; include endpoints)")
     args = parser.parse_args()
     missing = [k for k in ("DASHSCOPE_API_KEY", "TYPESAFE_API_KEY") if not os.getenv(k)]
     if missing:
         parser.error("missing environment variables: " + ", ".join(missing))
-    print(json.dumps(run(args), ensure_ascii=False))
+    print(json.dumps(run(args, sample_interval_seconds=args.sample_interval_seconds),
+                     ensure_ascii=False))
