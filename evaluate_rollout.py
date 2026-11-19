@@ -111,7 +111,7 @@ def evaluate(expert, predicate, rows, frame_size):
     return measurements, "supported" if observed == predicate else "contradicted"
 
 
-QWEN = "qwen3.6-flash"
+QWEN = "qwen3.8-flash"
 JEV = "jev-1.14.0"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 2.0
 PRIORITY = {
