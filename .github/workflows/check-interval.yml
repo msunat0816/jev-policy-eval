@@ -1,0 +1,49 @@
+name: Verify fixed-interval video sampling
+on:
+  push:
+    branches: [codex/verify-interval-sampling]
+permissions:
+  contents: read
+jobs:
+  sample:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install CPU video tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg python3-opencv
+      - name: Verify the sample grid against a real test video and the duration audit
+        run: |
+          /usr/bin/python3 - <<'PY'
+          import csv
+          import tempfile
+          from pathlib import Path
+          from urllib.request import urlretrieve
+          import cv2
+          from evaluate_rollout import frame_times, overview_indices
+          with open("notes/roborewardbench_video_durations.csv") as f:
+              rows = list(csv.DictReader(f))
+          assert len(rows) == 2831
+          assert sum(float(r["uniform8_max_gap_s"]) > 2 for r in rows) == 1468
+          assert max(float(r["interval2s_max_gap_s"]) for r in rows) <= 2
+          sample = next(r for r in rows if r["file_in_test"].startswith("robo_arena/") and r["duration_s"] == "40.1")
+          url = "https://huggingface.co/datasets/teetone/RoboReward/resolve/d69d5b92b8f3caee9a616b615b300bdf0d37aef2/test/" + sample["file_in_test"]
+          with tempfile.TemporaryDirectory() as tmp:
+              path = Path(tmp) / "test.mp4"
+              urlretrieve(url, path)
+              times = frame_times(path)
+              selected = overview_indices(times, 2)
+              assert len(times) == 401 and selected == list(range(0, 401, 20))
+              cap = cv2.VideoCapture(str(path))
+              for idx in selected:
+                  cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                  assert cap.read()[0], idx
+              cap.release()
+          assert overview_indices([0], 2) == [0]
+          assert overview_indices([10, 10.3, 12.1, 12.7, 14.6], 2) == [0, 2, 4]
+          print("Decoded all 21 coarse observations from a real 40.1-second clip.")
+          PY
