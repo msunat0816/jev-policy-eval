@@ -1,0 +1,38 @@
+name: Check approved coarse observation
+on:
+  push:
+    branches: [codex/first-delivery]
+    paths:
+      - 'prompts/**'
+      - 'coarse_observation.py'
+      - 'evaluate_rollout.py'
+      - 'tests/**'
+      - '.github/workflows/check-coarse-observation.yml'
+permissions:
+  contents: read
+jobs:
+  contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Reuse the CPU package setup from codex/verify-interval-sampling.
+      - name: Install CPU dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends python3-opencv
+      - name: Validate output contract and mocked observer integration
+        shell: bash
+        run: |
+          set -o pipefail
+          /usr/bin/python3 -m unittest discover -s tests -v 2>&1 | tee "$RUNNER_TEMP/coarse-observation-tests.txt"
+      - name: Save test log and approved prompt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coarse-observation-checks
+          path: |
+            ${{ runner.temp }}/coarse-observation-tests.txt
+            prompts/qwen_coarse_observation.txt

@@ -13,6 +13,8 @@ from urllib.request import Request, urlopen
 import cv2
 import numpy as np
 
+from coarse_observation import OBSERVE, SCHEMA_VERSION, parse_observation
+
 
 GEOMETRY = {"image_left", "image_right", "image_above", "image_below"}
 MOTION = {"relative_move", "relative_still"}
@@ -131,18 +133,6 @@ GRADES = {
     "level_5": "All requirements are satisfied at the end of the episode.",
     "insufficient_evidence": "The admissible evidence cannot distinguish the possible grades.",
 }
-OBSERVE = """Describe only visible facts for this task. Return a JSON object with two arrays.
-frames: one {frame: actual integer frame index, observation: brief text,
-boxes: {entity_name: [x1,y1,x2,y2]}} per supplied frame. Coordinates in 0..1000.
-Use consistent entity names; omit boxes for occluded, uncertain, or indistinguishable entities.
-requirements: cover EVERY explicit task requirement, including those no expert can verify.
-Each item has text, subject, reference (entity names), and predicate. Allowed predicates:
-image_left, image_right, image_above, image_below for EXPLICIT camera-plane relations only;
-relative_move and relative_still for explicitly observable planar motion relative to a named
-visible reference; unsupported for everything else. Do not simplify grasp, release, placing,
-3D support, robot-centric direction, object identity or containment into a 2D predicate.
-Include relevant actor/object boxes even for unsupported requirements. Descriptions and boxes
-are proposals only. Do not predict a final grade."""
 
 
 def save(path, obj):
@@ -243,20 +233,9 @@ def observe(task, indices, times, cap, folder):
     result = post(base.rstrip("/") + "/chat/completions", os.environ["DASHSCOPE_API_KEY"],
                   {"model": QWEN, "enable_thinking": False, "response_format": {"type": "json_object"},
                    "messages": [{"role": "user", "content": content}]}, folder, "01-observe")
-    obs = json.loads(result["choices"][0]["message"]["content"])
-    frames, requirements = obs["frames"], obs["requirements"]
-    if sorted(f["frame"] for f in frames) != indices or not requirements:
-        raise ValueError("missing/duplicate coarse frames or missing task requirements")
-    for frame in frames:
-        if not isinstance(frame["boxes"], dict) or not isinstance(frame["observation"], str):
-            raise ValueError("invalid coarse frame")
-    for r in requirements:
-        if r["predicate"] not in PREDICATES or not all(isinstance(r[k], str)
-                for k in ("text", "subject", "reference")):
-            raise ValueError("invalid requirement or binding")
-    return {"frames": [{k: f[k] for k in ("frame", "observation", "boxes")} for f in frames],
-            "requirements": [{k: r[k] for k in ("text", "subject", "reference", "predicate")}
-                             for r in requirements]}
+    obs = parse_observation(result["choices"][0]["message"]["content"], indices)
+    save(folder / "01-observation.json", obs)
+    return obs
 
 
 def route(task, obs, windows, folder):
@@ -302,9 +281,14 @@ def collect(cap, obs, windows, routes, times, size):
                 if error:
                     record["reason"] = error
                 else:
-                    record["measurement"], record["status"] = evaluate(expert, req["predicate"], rows, size)
+                    # V2 Qwen describes task semantics; it no longer invents tool predicates.
+                    # Until the reviewed semantic adapter exists, retain measurements only.
+                    predicate = req.get("predicate", "unsupported")
+                    if "predicate" not in req:
+                        record["semantic_unknown_reason"] = "requirement_to_measurement_adapter_pending"
+                    record["measurement"], record["status"] = evaluate(expert, predicate, rows, size)
                     if expert == "layout":
-                        initial, initial_state = evaluate(expert, req["predicate"], rows[:1], size)
+                        initial, initial_state = evaluate(expert, predicate, rows[:1], size)
                         record["initial_measurement"] = initial
                         record["initial_status"] = initial_state
                     record["measurement_available_at_pts"] = times[last]
@@ -362,12 +346,14 @@ def run(args, *, sample_interval_seconds=DEFAULT_SAMPLE_INTERVAL_SECONDS):
              "coarse_sampling": {"method": "fixed_interval_pts_v1", "interval_seconds": sample_interval_seconds,
                                  "n_selected": len(indices), "max_actual_gap_seconds": max_gap},
              "qwen": QWEN, "jev": JEV, "expert_config": CONFIG, "window_threshold": 2,
+             "coarse_observation_schema": SCHEMA_VERSION,
              "protocol": "roboreward-end-state-v1; cpu-experts-v1; jev-threshold-all-windows-v1"})
         obs = observe(args.task, indices, times, cap, folder)
         routes = route(args.task, obs, windows, folder)
         decisions, evidence = collect(cap, obs, windows, routes, times, size)
         path = folder / "03-evidence.json"
         save(path, {"task": args.task, "requirements": obs["requirements"],
+                    "candidate_checks": obs["candidate_checks"],
                     "windows": decisions, "evidence": evidence})
         result = score_saved(path)
         result["elapsed_seconds"] = time.monotonic() - started
