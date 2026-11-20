@@ -78,6 +78,10 @@ python3 -m unittest discover -s tests -v
 
 结构测试只依赖标准库；没有 OpenCV/NumPy 时集成测试明确跳过。CPU Actions 安装依赖，执行模拟集成检查并上传 `coarse-observation-checks` artifact，包含日志及批准的 prompt。
 
+2026-11-20 验证记录：[代码/工作流提交 `435b9d7`](https://github.com/msunat0816/jev-policy-eval/commit/435b9d767118bc3601dc38172dcce66d2764e825) 的 [CPU Actions](https://github.com/msunat0816/jev-policy-eval/actions/runs/44686307873) 已通过全部 11 项测试，无跳过项；[artifact](https://github.com/msunat0816/jev-policy-eval/actions/runs/44686307873/artifacts/14606552201) 已下载并打开，内含测试日志与 prompt，prompt 与批准的源文件逐字节一致。ZIP SHA256 为 `126a66fa8ee7edd5ca764d2ffdf893d01f406afa5f5353fc4ff6349a746e92d7`。这只验证结构和模拟集成，不验证真实 Qwen/JEV 的行为。
+
+此前 [首次检查运行](https://github.com/msunat0816/jev-policy-eval/actions/runs/44685402241) 在系统依赖安装阶段达到 10 分钟上限后结束为 `cancelled`，测试步骤未执行；保留该记录，并将工作流改为 Python 3.11 + headless OpenCV wheels；没有改动测试判据或调用真实模型。
+
 ## 后续真实验收配置和要求
 
 先完成上述设计检查和适配，再核对：
