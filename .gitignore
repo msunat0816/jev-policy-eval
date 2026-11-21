@@ -2,3 +2,12 @@
 __pycache__/
 *.py[cod]
 .local-checks/
+
+# Local validation evaluation data and credentials
+.venv-benchmark/
+benchmark-data/
+benchmark-runs/
+benchmark-output/
+.env
+.env.*
+.DS_Store

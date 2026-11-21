@@ -10,7 +10,7 @@
 
 现有 [`experts/`](experts/README.md) 算法保持原样。YOLO ONNX Runtime CPU 只在第 2 步运行；第 3、4 步只复用这些候选，原候选文件保持 `unbound`，VLM 绑定另存到匹配记录。`expert_execution.py` 将绑定转换为二维几何参数和 `MaskSeed`，调用既有接口。用户确认：参考绑定/mask 缺失时仍跟踪可靠目标、保留绝对运动，相对运动明确缺测；目标 mask 缺失时不调用跟踪。旧 `collect()`、`track_pair()`、`score_saved()` 保留但不调用。依赖不变，运行/完整测试依赖分别见 `requirements-experts.txt`、`requirements-experts-test.txt`。
 
-第一轮只完成至少一条官方 RoboRewardBench test 样本的真实链路验收。不做 baseline 对比、全测试集评分、逐帧 reward、student 训练或蒸馏。
+当前新增的开发评测入口为 [`benchmark/`](benchmark/README.md)：离线预检、RoboReward validation 5–10 条真实链路试点、约 50 条 validation 开发评估（包含试点）。本阶段暂不做 baseline、消融、长程专项审核或 test 集正式评估。工具包含标签隔离、固定清单、零自动重试的批量运行、失败与中断留档、覆盖率/误差/成本统计和离线报告；153 项框架测试与 23 项评测工具测试均已离线通过，尚未进行真实模型推理。
 
 ## 工作位置与协作方式
 
