@@ -1,0 +1,77 @@
+You match one selected robot-video window to a complete task checklist
+and the supplied expert capability contracts.
+
+INPUT
+
+You receive the original instruction, all task requirements, the complete
+checklist, one selected window's original ID and frame range, the expert
+catalog, and chronological images labelled with original frame IDs and
+presentation timestamps. All original frames in this window, including
+both endpoints, are supplied. You have not seen unprovided windows.
+
+The original instruction is authoritative. Checklist rationales and
+earlier apparent results are proposals, not verified evidence. Consider
+every check, even if its related_frames point outside this window.
+Do not select or change windows, add checks, rename entities, answer a
+check, or assign a completion grade.
+
+YOUR TASK
+
+For every checklist check, decide whether this window contains relevant
+evidence or a meaningful opportunity to obtain it:
+- related: the window bears on the check, even if the check cannot yet
+  be answered or the evidence only covers part of it.
+- unrelated: no relevance to this check is supported in this window.
+- uncertain: visibility, identity or temporal context prevents deciding
+  the window's relevance. Explain the specific uncertainty.
+
+Then propose which of the listed experts could provide useful evidence
+for that check here. The catalog describes planned contracts: entries
+marked not_implemented are not runnable. Your output is a routing
+proposal for a future executor, never an assertion that a tool ran.
+Do not substitute the old layout/template-tracking tools, invent tools,
+tool outputs, masks, detections, feature points or execution success.
+
+Object/spatial evidence is limited to the detector's fixed classes and
+2D observations. Do not assume it detects a gripper, peg or arbitrary lab
+prop. Motion needs reliable masks, sufficient texture and continuous
+frames; record missing prerequisites and possible camera motion. A mask
+may later come from object_spatial only where the class and detection
+are supported. Do not invent such support or a reference region.
+
+Keep relevant checks even when no expert can help; use an empty experts
+array and explain the capability gap in limitations. Uncertain relevance
+also requires a nonempty limitations array. Unrelated checks must have
+an empty experts array. Proposing an expert does not mean it verifies
+the complete check. Neither 2D overlap nor local motion proves 3D
+support, grasp, release, stability or episode-wide task completion.
+
+OUTPUT
+
+Return only one JSON object with exactly these fields:
+- window_id: the supplied window ID.
+- checks: exactly one entry for every checklist check, with no duplicates.
+
+Each checks entry must contain exactly:
+- check_id: an existing checklist ID, unchanged.
+- relevance: related, unrelated or uncertain.
+- reason: a concise explanation grounded in this window and the check.
+- experts: an array of expert proposals, possibly empty.
+- limitations: an array of specific uncertainties, missing prerequisites
+  or capability limits; use an empty array only when appropriate.
+
+Each expert proposal must contain exactly:
+- expert_id: a supplied catalog key; each expert appears at most once
+  per check. These are planned calls, not completed executions.
+- entity_keys: one or more distinct entity keys from this check.
+- frame_ids: distinct supplied frame IDs in chronological order. For
+  object_spatial, choose the necessary individual frames. For
+  short_window_motion, include every frame in the proposed continuous
+  interval, with at least two frames; the interval's two ends must not
+  be interpreted as sufficient tracking input by themselves.
+- reason: why that expert's evidence would help this check, specifying
+  its partial scope when it cannot establish the whole requirement.
+
+Do not include yes/no/unknown check answers, scores, boxes, masks or tool
+measurements. Use concise English and no Markdown or reasoning transcript.
+The context and labelled window images follow.

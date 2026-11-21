@@ -1,30 +1,32 @@
 # FYP 框架维护文档：基于 JEV 的证据驱动机器人轨迹评价
 
-## 当前执行规格 · 第一轮 · 2026-11-20
+## 当前执行规格 · 第一轮 · 2026-11-21
 
-本轮交付单条 RoboRewardBench 视频的离线评价。Qwen 粗看一次，JEV 选窗，CPU 程序取证，先保存带时间的证据，再由 JEV 按 RoboReward 的终局 1–5 档评分或返回证据不足。第 1–12 节保留 10 月的研究方案，涉及选型、预算、循环补看和对比实验时以本节为准。
+目标为单条 RoboRewardBench 视频的四阶段离线评价：VLM 粗看与完整 checklist → JEV 选窗 → VLM 匹配 check/expert → 工具取证后 JEV 逐 check 判断与终局评分。2026-11-21 用户已批准加入第三步，当前入口运行至 VLM 匹配，保存后返回 `awaiting_expert_execution`；expert 执行与新版判断/评分须先获允许再修改。第 1–12 节保留 10 月的研究方案，涉及选型、预算、循环补看和对比实验时以本节为准。
 
-**已确认的 Qwen 定位：结合原始 instruction 和稀疏采样视频，给出具体、与任务相关的视觉描述。instruction 引导关注对象和变化，视频使描述具体化。** 保留候选框作为定位提示，逐帧分开记录可见内容与未知，并由 Qwen 提出关联要求、实体和采样帧的具体待核验点。完整实际 prompt 见 [prompts/qwen_coarse_observation.txt](prompts/qwen_coarse_observation.txt)。
+**已确认的 VLM 粗看定位：结合原始 instruction 和稀疏采样帧，逐帧描述机器人操作、相关对象及未知，并生成完整 checklist。** 看似已完成、失败、不可见或缺乏工具覆盖的要求均保留对应问题，不做窗口匹配。保留现有 `requirements / frames / candidate_checks` 字段及候选框格式，`candidate_checks` 现在表示完整 checklist。完整实际 prompt 见 [prompts/qwen_coarse_observation.txt](prompts/qwen_coarse_observation.txt)。
 
-实现进度：prompt 与 `task-guided-coarse-v2` 解析已落地；JEV 的窗口—待核验点配对及自然语言要求—程序测量的语义适配仍待下一步检查。新要求不再携带 Qwen 生成的旧 `predicate`；适配前 CPU 保留 `measurement_only`，标注 `requirement_to_measurement_adapter_pending`，现有终评保护会因没有决定性判定而弃答。此状态不能当作真实模型验收。工作分支、验证边界及交接步骤见 [README](README.md)。
+实现进度：粗看、`jev-window-selection-v2` 选窗和 `vlm-window-check-expert-v1` 匹配已落地。匹配模型暂定 `qwen3.8-flash`，契约/校验在 `vlm_matching.py`，独立 prompt 为 `prompts/qwen_window_matching.txt`，视频读取和调用在 `evaluate_rollout.py::match_windows()`。本机 51 项离线检查全部通过，模型响应均为模拟；用户已授权提交并推送至 `first-delivery`，远端验证以该分支对应的 Actions 结果为准。旧 CPU 取证、受限适配 A 和评分函数保留，当前入口不调用，不能视为新版下游。精确行为与旧实现边界见 [README](README.md)。
 
 | 步骤 | 本轮行为 |
 |---|---|
 | 输入 | 从官方数据取得原始视频、任务指令、split 和样本 ID。评估入口只接收这些信息，参考分在预测保存后关联。 |
-| 粗观察 | 从第一帧原始 PTS 开始，每 2 秒取每个非空时间段的第一帧，另保留末帧，按原始帧号去重，无 8 帧上限。百炼非思考模式 `qwen3.8-flash` 一次接收 instruction、所有采样图片及帧号/时间戳，输出自然语言 `requirements`、逐帧 `visible_facts / uncertainties / boxes` 和带引用的 `candidate_checks`。身份、框及描述均为模型提议，不让 Qwen 选窗、指派 expert 或给分。 |
-| 选窗 | 相邻采样帧定义窗口。目标是程序构造窗口与待核验点的有限组合，JEV 做原子 Choice，不自由生成清单。`jev-1.14.0` 逐窗选择 0（无关）、1（相关但重复）、2（存在可核验的要求）、3（核心歧义、矛盾或撤销）。所有窗口包括末段均按 ≥2 核验，数量不限且可为零。JEV 选择布局、相对运动、两者或均不适用。组合配对尚待检查；当前仍是旧的窗口 × requirement 提问。 |
-| 专家测量 | Python 在原始帧范围运行 OpenCV。以粗看给出的窗口起点框为种子，尝试匹配目标与参照物，记录逐帧像素框。布局程序测量图像平面内的框间距，相对运动程序测量两者相对中心的最大位移。相同窗口和对象对共享匹配结果。 |
-| 证据 | 记录时间戳、原始帧号、任务要求、框与绑定来源、测量值与单位、适用条件的判断和未知原因。运动阈值和匹配阈值是原型设置，需验证。模板不适用于大形变、严重遮挡、镜头或视角明显变化的物理解释。二维框重叠不足以验证三维放置、接触或释放。 |
-| 终分 | JEV 只读任务、要求和已写盘的程序证据。时间窗优先级和粗观察叙述不参与终分。它根据终局 rubric 选择 1–5 档或弃答；全部已选窗口都缺乏有效证据、或 5 档缺乏每项要求的最新支持证据时，控制器保留原始选择并输出弃答。JEV 根据已核验证据判断其能否支持终局分，允许末段未入选。 |
+| 粗观察 | 采样和模型配置不变：每 2 秒取每个非空时间段的第一帧，另保留末帧，无 8 帧上限；`qwen3.8-flash` 非思考模式一次读取 instruction、所有采样图片及帧号/PTS。输出自然语言要求、逐帧可见内容/未知/候选框，以及覆盖全部任务要求的 checklist。 |
+| 选窗 | 相邻采样帧定义窗口。完整 instruction、requirements、checklist 及全部逐帧粗观察作为共享 state；不提交候选框或 expert 能力。`jev-1.14.0` 一次批量请求，每窗口一个独立 Choice：0 无关、1 相关但重复、2 值得细看、3 核心歧义/矛盾/撤销。所有 ≥2 的窗口入选，可为零、无上限，末段采用相同规则。related_frames 不限制可选窗口。不匹配 check、不指派 expert、不判完成。空 checklist 或未覆盖全部 requirement ID 时在调用前报错；此检查不保证语义完整。 |
+| 选窗输出 | `02-selected-windows.json` 保存协议、阈值、全部窗口判断与选中列表；每窗口含原始 ID、帧范围、优先级、是否入选。原始请求/响应保存在 `02-select-windows.json`。非法或缺失选择报错，不伪造配对/工具结果。 |
+| VLM 匹配 | 每个选中窗口一次 `qwen3.8-flash` 非思考 JSON 请求，读取窗口内全部连续原始帧（包含两端），带原帧号/PTS，不另设采样上限。上下文含原 instruction、全部 requirements/checklist 和两类 expert 契约。每个 check 返回 related/unrelated/uncertain、原因、expert 提议和限制；expert 提议含 ID、check 实体、取证帧和原因。不回答 check，不评分。空选择不调用匹配 API。 |
+| 匹配契约与输出 | `object_spatial` 描述 YOLO nano 分割/ONNX CPU，`short_window_motion` 描述金字塔 LK 光流，两者均标记 not_implemented，只作未来执行提议。校验选窗一致性、完整 checklist 引用及窗口/check/expert/实体/帧引用；拒绝旧 layout/motion 和 completion verdict。图片在 matching_frames/窗口ID/；原调用 trace、逐窗口匹配和总匹配分别保存为 03-match-窗口ID.json、03-matching-窗口ID.json、03-window-matching.json。总匹配标记 proposals_only，不能当作工具证据。 |
+| 工具取证（待更新） | 对象与空间、短窗口运动 expert 的新版实现尚未接入；现有模板匹配和二维测量代码仅作为旧实现保留。 |
+| 判断与终分（待更新） | 工具执行后按每个 check 综合其相关窗口证据给一次 yes/no/unknown，再结合原 instruction、完整任务要求、答案和证据按 rubric 给分；不足以区分等级时返回 insufficient_evidence。 |
 
-评价入口和 CPU 工具在 `evaluate_rollout.py`，粗观察 prompt 与校验在 `coarse_observation.py`。环境需要 Python 3.11+、OpenCV、NumPy、ffprobe。真实调用前须核对 `DASHSCOPE_API_KEY`、`TYPESAFE_API_KEY` 和香港工作空间的完整兼容 `DASHSCOPE_BASE_URL`，不打印密钥、不静默回退新加坡。**当前旧端点回退代码尚待移除，新 schema 下游适配也未完成；以下是适配与配置检查完成后的目标运行方式，不是本阶段的真实验收命令。** 输入替换为同一条真实样本字段，输出目录须为新目录。
+入口和旧 CPU 工具在 `evaluate_rollout.py`，粗观察 prompt 与校验在 `coarse_observation.py`，选窗和匹配契约分别在 `window_selection.py`、`vlm_matching.py`。环境需要 Python 3.11+、OpenCV、NumPy、ffprobe，本轮无新增依赖。真实调用前须核对 `DASHSCOPE_API_KEY`、`TYPESAFE_API_KEY` 和香港工作空间的完整兼容 `DASHSCOPE_BASE_URL`，不打印密钥、不静默回退新加坡。**旧端点回退行为沿用，本轮没有真实模型验收。** 以下保留调用格式，当前运行只到 VLM 匹配，输出目录须为新目录。
 
 ```sh
 python evaluate_rollout.py --video "$ROLLOUT_VIDEO" --task "$ROLLOUT_TASK" \
   --episode "$ROLLOUT_SAMPLE_ID" --split test --out run-001
 ```
 
-每次运行保留 `run.json`（视频哈希、抽帧与时间映射、版本和参数）、实际输入 JPEG、逐调用请求与响应（含服务返回的用量和本地计时）、`03-evidence.json`、`result.json`。单条证据的帧号可通过视频哈希和时间映射回放。数值结果适用于申明的二维条件；没有对应工具的条件按未知处理。首轮证据可以用于第二轮定位和再标注。Qwen 的粗观察看过首尾，因此生成严格前缀监督时仍需排除未来信息。RoboRewardBench 的 test 样本保留作评测。
+当前运行保留 `run.json`（视频哈希、采样/时间映射、模型、选窗/匹配协议与全帧策略）、粗看/匹配 JPEG、粗观察 JSON、逐调用请求/响应、选窗和逐窗口/总匹配文件、`result.json`。结果状态为 `awaiting_expert_execution`，`score=null`，含选窗/匹配文件路径、选中窗口及匹配窗口数；不调用旧取证/评分，不写 `03-evidence.json`。非法匹配报错且不自动重试，已有 trace 和已完成窗口记录保留。Qwen 粗观察看过首尾，因此未来生成严格前缀监督时仍须排除未来信息。RoboRewardBench 的 test 样本保留作评测。
 
 ### 粗观察的时间间隔与输入成本
 
@@ -34,7 +36,7 @@ RoboRewardBench 的官方 test 清单有 2,831 条。逐文件读取 MP4 视频�
 
 ### 粗观察里“候选框”的含义
 
-例如“把米色积木放到托盘左侧的柱子上”，Qwen 可以在一张原图上分别给“米色积木”和“左侧柱子”各一个矩形框。每个框保存左上角和右下角坐标 `[x1,y1,x2,y2]`，横纵轴分别归一化到 0–1000。JEV 选中一个窗口后，OpenCV 用**窗口起始帧**中的两个框裁取图像模板，再在窗口内跟踪和测量。对象被遮挡或身份不清时可以省略框；框缺失或匹配失败会留下未知原因。两个框靠近或重叠只能提供二维位置线索，无法据此证明积木已插到柱子上。
+例如“把米色积木放到托盘左侧的柱子上”，Qwen 可以给“米色积木”和“左侧柱子”各一个候选框 `[x1,y1,x2,y2]`，横纵轴归一化到 0–1000。该字段为兼容现有 schema 保留，对象被遮挡或身份不清时可省略。当前选窗只读文字粗观察，不读候选框，也不运行跟踪。旧 `collect()` 仍以窗口起始帧中的两个框作模板，但它已从当前入口断开；新版 expert 尚未实现。两个框靠近或重叠仅是二维线索，无法据此证明积木已插到柱子上。
 
 VeriPhy 区分测量、学习型子判断和三值结论。其对象细类、动作事件和深度次序仍有学习型核验；本项目采用其带类型和来源的证据设计，并自行选择 JEV 终局评分。[VeriPhy §4.3](https://arxiv.org/html/2609.03153v1#S4.SS3)、[RoboReward 附录 A.2.2](https://arxiv.org/html/2601.00675v2)、[JEV 接口](https://docs.typesafe.ai/models)
 

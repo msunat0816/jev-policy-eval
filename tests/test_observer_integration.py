@@ -54,11 +54,14 @@ class ObserverIntegrationTests(unittest.TestCase):
         rows = [{"frame": i, "subject_xyxy": [5, 5, 10, 10],
                  "reference_xyxy": [25, 5, 30, 10]} for i in range(7, 28)]
         with patch.object(ev, "track_pair", return_value=(rows, None)):
-            decisions, evidence = ev.collect(None, obs, [(7, 27)],
-                                             {"w0": "p2", "w0r0": "layout"},
+            decisions, evidence = ev.collect(None, "Place the beige block on the left peg.", obs, [(7, 27)],
+                                             {"w0c0_priority": "p2", "w0c0_layout": "useful",
+                                              "w0c0_motion": "not_applicable"},
                                              [i / 10 for i in range(28)], (64, 48))
         self.assertEqual(evidence[0]["status"], "measurement_only")
-        self.assertEqual(evidence[0]["semantic_unknown_reason"], "requirement_to_measurement_adapter_pending")
+        self.assertEqual(evidence[0]["requirement_status"], "unknown")
+        self.assertEqual(evidence[0]["measurement_status"], "available")
+        self.assertEqual(evidence[0]["semantic_unknown_reason"], "original_instruction_outside_supported_language")
         self.assertIn("end_box_gaps_px", evidence[0]["measurement"])
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "03-evidence.json"

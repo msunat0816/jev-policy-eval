@@ -1,10 +1,13 @@
 name: Check approved coarse observation
 on:
   push:
-    branches: [codex/first-delivery]
+    branches: [first-delivery, codex/first-delivery]
     paths:
       - 'prompts/**'
       - 'coarse_observation.py'
+      - 'measurement_adapter.py'
+      - 'window_selection.py'
+      - 'vlm_matching.py'
       - 'evaluate_rollout.py'
       - 'tests/**'
       - '.github/workflows/check-coarse-observation.yml'
@@ -27,7 +30,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --timeout 30 --retries 1 'numpy>=1.26,<3' 'opencv-python-headless>=4.10,<5'
           python -m pip freeze
-      - name: Validate output contract and mocked observer integration
+      - name: Validate observation, all-pairs routing and bounded measurement adapter
         shell: bash
         run: |
           set -o pipefail

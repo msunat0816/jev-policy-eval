@@ -1,4 +1,4 @@
-"""Evaluate one local RoboReward video using Qwen, text-only JEV and CPU experts."""
+"""Run coarse VLM observation, JEV window selection and VLM check/expert matching."""
 import argparse
 import base64
 import hashlib
@@ -14,13 +14,16 @@ import cv2
 import numpy as np
 
 from coarse_observation import OBSERVE, SCHEMA_VERSION, parse_observation
+from measurement_adapter import (ADAPTER_VERSION, LAYOUT_MARGIN_PX, adapt_requirement, requirement_states,
+                                 requirement_verdict)
+from window_selection import (SELECTION_PROTOCOL, WINDOW_THRESHOLD, build_selection_request,
+                              summarize_selection)
+from vlm_matching import (EXPERT_CATALOG, MATCHING_MODEL, MATCHING_PROMPT, MATCHING_PROTOCOL,
+                          matching_context, parse_window_matching, validate_matching_inputs)
 
 
-GEOMETRY = {"image_left", "image_right", "image_above", "image_below"}
-MOTION = {"relative_move", "relative_still"}
-PREDICATES = GEOMETRY | MOTION | {"unsupported"}
 CONFIG = {"match_min": 0.82, "peak_margin": 0.08, "min_gray_std": 8,
-          "still_max_diagonal": 0.01, "move_min_diagonal": 0.03}
+          "layout_margin_px": LAYOUT_MARGIN_PX}
 
 
 def seed(gray, normalized_box):
@@ -74,8 +77,8 @@ def track_pair(cap, first, last, boxes, subject, reference):
     return rows, None
 
 
-def evaluate(expert, predicate, rows, frame_size):
-    """A verdict applies to the stated 2D predicate at the declared scope only."""
+def measure(expert, rows, frame_size):
+    """Return quantities only; task verdicts require a separate semantic adapter."""
     a = np.array([r["subject_xyxy"] for r in rows])
     b = np.array([r["reference_xyxy"] for r in rows])
     if expert == "layout":
@@ -83,48 +86,25 @@ def evaluate(expert, predicate, rows, frame_size):
         u, v, u2, v2 = b[-1]
         gaps = dict(zip(("image_left", "image_right", "image_above", "image_below"),
                         map(int, (u-x2, x-u2, v-y2, y-v2))))
-        measurements = {"end_box_gaps_px": gaps}
-        if predicate not in GEOMETRY:
-            return measurements, "measurement_only"
-        gap = gaps[predicate]
-        opposite = {"image_left": "image_right", "image_right": "image_left",
-                    "image_above": "image_below", "image_below": "image_above"}
-        if gap > 2:
-            return measurements, "supported"
-        if gaps[opposite[predicate]] > 2:
-            return measurements, "contradicted"
-        return measurements, "unknown"
-
+        return {"end_box_gaps_px": gaps}
+    if expert != "motion":
+        raise ValueError(f"unknown expert: {expert}")
     offsets = ((a[:, :2] + a[:, 2:]) - (b[:, :2] + b[:, 2:])) / 2
     displacement = float(np.linalg.norm(offsets - offsets[0], axis=1).max())
     fraction = displacement / math.hypot(*frame_size)
-    measurements = {"max_relative_excursion_px": displacement,
-                    "fraction_of_image_diagonal": fraction}
-    if predicate not in MOTION:
-        return measurements, "measurement_only"
-    if len(rows) < 2:
-        return measurements, "unknown"
-    if fraction <= CONFIG["still_max_diagonal"]:
-        observed = "relative_still"
-    elif fraction >= CONFIG["move_min_diagonal"]:
-        observed = "relative_move"
-    else:
-        return measurements, "unknown"
-    return measurements, "supported" if observed == predicate else "contradicted"
+    return {"max_relative_excursion_px": displacement,
+            "fraction_of_image_diagonal": fraction}
 
 
 QWEN = "qwen3.8-flash"
 JEV = "jev-1.14.0"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 2.0
-PRIORITY = {
-    "p0": "No relevant change or open question.",
-    "p1": "Relevant but redundant. Checking this interval adds no decisive evidence.",
-    "p2": "A specific requirement is unresolved and evidence here could settle it.",
-    "p3": "A core ambiguity, contradiction or possible reversal could change the final grade.",
+# Legacy collection helpers below retain their existing measurements. They are not
+# called by the current entry point, which stops after matching, before experts.
+MEASUREMENTS = {
+    "layout": "Signed image-plane box separation at the window's final frame.",
+    "motion": "Maximum 2D relative-center excursion from the window's first frame, over the window.",
 }
-ROUTES = {"layout": "Check signed image-plane box separation at interval end.",
-          "motion": "Measure 2D movement relative to a visible reference across the interval.",
-          "both": "Both measurements bear on the question.", "none": "Neither expert can help."}
 GRADES = {
     "level_1": "No goal-relevant end-state change.",
     "level_2": "Small but insufficient goal-relevant end-state change.",
@@ -141,14 +121,14 @@ def save(path, obj):
     tmp.replace(path)
 
 
-def post(url, key, body, folder, name):
+def post(url, key, body, folder, name, *, image_directory="frames"):
     raw = json.dumps(body, ensure_ascii=False)
     # Persist the exact prompt; JPEG files are stored separately from the text trace.
     body_log = json.loads(raw)
     for msg in body_log.get("messages", []):
         for part in msg["content"]:
             if part.get("type") == "image_url":
-                part["image_url"] = "JPEGs in frames/, in prompt order"
+                part["image_url"] = f"JPEGs in {image_directory}/, in prompt order"
     call = {"url": url, "request": body_log, "attempt": 1, "cache": "no_client_cache"}
     path = folder / (name + ".json")
     start = time.monotonic()
@@ -238,93 +218,165 @@ def observe(task, indices, times, cap, folder):
     return obs
 
 
-def route(task, obs, windows, folder):
-    questions = {}
-    for i, (first, last) in enumerate(windows):
-        scope = f"For frames {first} through {last} inclusive"
-        questions[f"w{i}"] = choice(scope + ", rate the value of checking this window for the final grade.", PRIORITY)
-        for j, req in enumerate(obs["requirements"]):
-            questions[f"w{i}r{j}"] = choice(scope + ", choose all applicable measurement types for: " + req["text"], ROUTES)
-    return ask_jev({"task": task, "observations": obs}, questions, folder, "02-route")
+def select_windows(task, obs, windows, folder):
+    state, questions = build_selection_request(task, obs, windows)
+    answers = ask_jev(state, questions, folder, "02-select-windows") if questions else {}
+    selection = summarize_selection(windows, answers)
+    save(folder / "02-selected-windows.json", selection)
+    return selection
 
 
-def collect(cap, obs, windows, routes, times, size):
+def match_windows(task, obs, selection, times, cap, folder):
+    selected = validate_matching_inputs(task, obs, selection, times)
+    matched = []
+    for window in selected:
+        first, last = window["frame_range"]
+        frame_ids = list(range(first, last + 1))
+        image_directory = f"matching_frames/{window['id']}"
+        (folder / image_directory).mkdir(parents=True, exist_ok=False)
+        content = [{"type": "text", "text": MATCHING_PROMPT + "\nContext: "
+                    + json.dumps(matching_context(task, obs, window), ensure_ascii=False)}]
+        cap.set(cv2.CAP_PROP_POS_FRAMES, first)
+        for index in frame_ids:
+            ok, image = cap.read()
+            if not ok:
+                raise ValueError(f"matching video decode failed at frame {index}")
+            ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 88])
+            if not ok:
+                raise ValueError(f"matching JPEG encoding failed at frame {index}")
+            (folder / image_directory / f"{index}.jpg").write_bytes(jpeg.tobytes())
+            content.append({"type": "text", "text": f"frame {index}, PTS {times[index]} seconds"})
+            content.append({"type": "image_url", "image_url": {
+                "url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}})
+        name = f"03-match-{window['id']}"
+        base = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+        response = post(base.rstrip("/") + "/chat/completions", os.environ["DASHSCOPE_API_KEY"],
+                        {"model": MATCHING_MODEL, "enable_thinking": False,
+                         "response_format": {"type": "json_object"},
+                         "messages": [{"role": "user", "content": content}]}, folder, name,
+                        image_directory=image_directory)
+        result = parse_window_matching(response["choices"][0]["message"]["content"], window,
+                                       obs["candidate_checks"], frame_ids)
+        record = {"window_id": window["id"], "frame_range": [first, last],
+                  "frame_ids": frame_ids, "pts_seconds": [times[i] for i in frame_ids],
+                  "image_directory": image_directory, "request_file": name + ".json",
+                  "checks": result["checks"]}
+        save(folder / f"03-matching-{window['id']}.json", record)
+        matched.append(record)
+    matching = {"protocol": MATCHING_PROTOCOL, "model": MATCHING_MODEL,
+                "status": "proposals_only", "task": task, "requirements": obs["requirements"],
+                "checklist": obs["candidate_checks"], "expert_catalog": EXPERT_CATALOG, "windows": matched}
+    save(folder / "03-window-matching.json", matching)
+    return matching
+
+
+def collect(cap, task, obs, windows, routes, times, size):
     evidence, decisions = [], []
     bindings = {f["frame"]: f["boxes"] for f in obs["frames"]}
+    requirements = {req["id"]: (j, req) for j, req in enumerate(obs["requirements"])}
     for i, (first, last) in enumerate(windows):
-        priority = int(routes[f"w{i}"][1:])
         terminal = i == len(windows)-1
-        decisions.append({"frame_range": [first, last], "priority": priority,
-                          "over_threshold": priority >= 2, "terminal_window": terminal})
-        if priority < 2:
-            continue
+        pairs = []
+        for j, check in enumerate(obs["candidate_checks"]):
+            key = f"w{i}c{j}"
+            priority = int(routes[key + "_priority"][1:])
+            pairs.append({"id": key, "check_id": check["id"],
+                          "requirement_ids": check["requirement_ids"], "entity_keys": check["entity_keys"],
+                          "related_frames": check["related_frames"], "priority": priority,
+                          "over_threshold": priority >= 2,
+                          "applicability": {e: routes[key + "_" + e] for e in MEASUREMENTS}})
+        priority = max((p["priority"] for p in pairs), default=None)
+        decisions.append({"id": f"w{i}", "frame_range": [first, last], "priority": priority,
+                          "priority_source": "max_pair_priority" if pairs else "no_candidate_checks",
+                          "over_threshold": priority is not None and priority >= 2,
+                          "terminal_window": terminal, "pairs": pairs})
         cache = {}
-        for j, req in enumerate(obs["requirements"]):
-            selection = routes[f"w{i}r{j}"]
-            experts = ["layout", "motion"] if selection == "both" else [selection]
-            for expert in experts:
-                record = {"id": f"w{i}r{j}-{expert}", "requirement": j, "expert": expert,
-                          "terminal_window": terminal, "frames": [first, last],
-                          "pts_seconds": [times[first], times[last]], "status": "unknown",
-                          "binding_source": "qwen_sparse_proposal", "binding_context_until": times[-1]}
-                evidence.append(record)
-                if expert == "none":
-                    record["reason"] = "no_applicable_program"
-                    continue
-                key = (req["subject"], req["reference"])
-                started = time.monotonic()
-                record["reused_track"] = key in cache
-                if key not in cache:
-                    cache[key] = track_pair(cap, first, last, bindings[first], *key)
-                rows, error = cache[key]
-                record["tracks"] = rows
-                if error:
-                    record["reason"] = error
-                else:
-                    # V2 Qwen describes task semantics; it no longer invents tool predicates.
-                    # Until the reviewed semantic adapter exists, retain measurements only.
-                    predicate = req.get("predicate", "unsupported")
-                    if "predicate" not in req:
-                        record["semantic_unknown_reason"] = "requirement_to_measurement_adapter_pending"
-                    record["measurement"], record["status"] = evaluate(expert, predicate, rows, size)
-                    if expert == "layout":
-                        initial, initial_state = evaluate(expert, predicate, rows[:1], size)
-                        record["initial_measurement"] = initial
-                        record["initial_status"] = initial_state
-                    record["measurement_available_at_pts"] = times[last]
-                record["seconds"] = time.monotonic() - started
+        for pair in pairs:
+            if not pair["over_threshold"]:
+                continue
+            for requirement_id in pair["requirement_ids"]:
+                req_index, req = requirements[requirement_id]
+                for expert, applicability in pair["applicability"].items():
+                    record = {"id": f"{pair['id']}r{req_index}-{expert}",
+                              "check_id": pair["check_id"], "pair_id": pair["id"],
+                              "requirement": req_index, "requirement_id": requirement_id, "expert": expert,
+                              "priority": pair["priority"], "applicability": applicability,
+                              "terminal_window": terminal, "frames": [first, last],
+                              "pts_seconds": [times[first], times[last]], "status": "unknown",
+                              "requirement_status": "unknown", "measurement_status": "unknown",
+                              "semantic_adapter": adapt_requirement(task, req, expert, [first, last], len(times)-1),
+                              "binding_source": "qwen_sparse_proposal", "binding_context_until": times[-1]}
+                    evidence.append(record)
+                    if applicability != "useful":
+                        record["reason"] = ("expert_not_applicable" if applicability == "not_applicable"
+                                            else "expert_applicability_unknown")
+                        continue
+                    key = (req["subject"], req["reference"])
+                    record["measurement_entities"] = {"subject": key[0], "reference": key[1]}
+                    record["measurement_target_source"] = "requirement_subject_reference"
+                    # Do not invent an object pair or replace a missing start-frame box.
+                    if (not all(key) or key[0] == key[1] or len(pair["entity_keys"]) != 2
+                            or set(pair["entity_keys"]) != set(key)):
+                        record["reason"] = "unsupported_check_entity_binding"
+                        continue
+                    started = time.monotonic()
+                    record["reused_track"] = key in cache
+                    if key not in cache:
+                        cache[key] = track_pair(cap, first, last, bindings[first], *key)
+                    rows, error = cache[key]
+                    record["tracks"] = rows
+                    if error or len(rows) != last-first+1 or [r["frame"] for r in rows] != list(range(first, last+1)):
+                        error = error or "incomplete_or_unordered_track"
+                        record["reason"] = error
+                    else:
+                        record["measurement"] = measure(expert, rows, size)
+                        record["measurement_status"] = "available"
+                        record["measurement_scope"] = "window_end" if expert == "layout" else "window_from_first_frame"
+                        verdict = requirement_verdict(record["semantic_adapter"], record["measurement"], len(rows))
+                        record["requirement_status"] = verdict
+                        record["status"] = ("measurement_only" if record["semantic_adapter"]["coverage"] != "direct"
+                                            else verdict)
+                        if verdict == "unknown":
+                            record["semantic_unknown_reason"] = (record["semantic_adapter"]["reason"]
+                                if record["semantic_adapter"]["coverage"] != "direct" else "measurement_not_decisive")
+                        if expert == "layout":
+                            record["initial_measurement"] = measure(expert, rows[:1], size)
+                            record["initial_measurement_frame"] = first
+                        record["measurement_available_at_pts"] = times[last]
+                    record["seconds"] = time.monotonic() - started
     return decisions, evidence
 
 
 def score_saved(path):
     bundle = json.loads(path.read_text())
-    records = [{k: v for k, v in e.items() if k != "tracks"} for e in bundle["evidence"]]
+    # Selection priorities, applicability proposals and coarse descriptions are not scoring evidence.
+    records = [{k: v for k, v in e.items() if k not in ("tracks", "priority", "applicability")}
+               for e in bundle["evidence"]]
+    states = requirement_states(bundle["requirements"], records)
     state = {"task": bundle["task"], "requirements": bundle["requirements"], "evidence": records,
+             "requirement_states": states,
              "episode_end_frame": bundle["windows"][-1]["frame_range"][1]}
     prompt = ("Assign the RoboReward end-state grade. Use only documented program results. "
               "Groundings are learned proposals. A 2D gap does not prove release, support, depth, "
               "or physical stability. Earlier achievements may be reversed. A skipped window is "
               "unobserved. Judge whether the selected evidence establishes the end state. Unsupported or missing "
-              "requirements remain unknown. Abstain if missing evidence can change the grade.")
+              "requirements remain unknown. measurement_status=available is not requirement satisfaction. "
+              "Only requirement_status and direct semantic contracts may establish a requirement. "
+              "A local or partial measurement does not establish an episode-wide or terminal requirement. "
+              "Abstain if missing evidence can change the grade.")
     answer = ask_jev(state, {"grade": choice(prompt, GRADES)}, path.parent, "04-judge")["grade"]
-    usable = [r for r in records if r["status"] in ("supported", "contradicted")]
+    usable = [s for s in states if s["status"] in ("supported", "contradicted")]
     reason = None
     if not usable:
         reason = "no_decisive_program_evidence"
     if reason is None and answer == "level_5":
-        for index in range(len(bundle["requirements"])):
-            checks = [r for r in records if r["requirement"] == index and r["status"] != "measurement_only"]
-            if not checks:
-                reason = "full_completion_lacks_evidence_for_each_requirement"
-                break
-            last_checked = max(r["frames"][1] for r in checks)
-            latest = {r["status"] for r in checks if r["frames"][1] == last_checked}
-            if latest != {"supported"}:
-                reason = "full_completion_lacks_evidence_for_each_requirement"
-                break
+        if any(s["status"] != "supported" for s in states):
+            reason = "full_completion_lacks_evidence_for_each_requirement"
     score = None if reason or answer == "insufficient_evidence" else int(answer[-1])
     return {"score": score, "status": "insufficient_evidence" if score is None else "scored",
-            "jev_choice": answer, "guard_reason": reason, "evidence_file": path.name}
+            "jev_choice": answer, "guard_reason": reason, "evidence_file": path.name,
+            "requirement_states": states,
+            "supporting_evidence_ids": sorted({i for s in usable for i in s["evidence_ids"]})}
 
 
 def run(args, *, sample_interval_seconds=DEFAULT_SAMPLE_INTERVAL_SECONDS):
@@ -345,17 +397,27 @@ def run(args, *, sample_interval_seconds=DEFAULT_SAMPLE_INTERVAL_SECONDS):
              "frame_pts_seconds": times, "observed_indices": indices, "opencv": cv2.__version__,
              "coarse_sampling": {"method": "fixed_interval_pts_v1", "interval_seconds": sample_interval_seconds,
                                  "n_selected": len(indices), "max_actual_gap_seconds": max_gap},
-             "qwen": QWEN, "jev": JEV, "expert_config": CONFIG, "window_threshold": 2,
+             "qwen": QWEN, "jev": JEV,
              "coarse_observation_schema": SCHEMA_VERSION,
-             "protocol": "roboreward-end-state-v1; cpu-experts-v1; jev-threshold-all-windows-v1"})
+             "window_selection": {"protocol": SELECTION_PROTOCOL, "unit": "window",
+                                  "choices_per_window": ["priority"],
+                                  "context": "full_checklist_and_all_coarse_observations",
+                                  "threshold": WINDOW_THRESHOLD},
+             "vlm_matching": {"protocol": MATCHING_PROTOCOL, "model": MATCHING_MODEL,
+                              "frames": "all_original_frames_inclusive",
+                              "calls": "one_per_selected_window", "expert_execution": False},
+             "execution_scope": "coarse_observation_window_selection_and_matching",
+             "protocol": SCHEMA_VERSION + "; " + SELECTION_PROTOCOL + "; " + MATCHING_PROTOCOL})
         obs = observe(args.task, indices, times, cap, folder)
-        routes = route(args.task, obs, windows, folder)
-        decisions, evidence = collect(cap, obs, windows, routes, times, size)
-        path = folder / "03-evidence.json"
-        save(path, {"task": args.task, "requirements": obs["requirements"],
-                    "candidate_checks": obs["candidate_checks"],
-                    "windows": decisions, "evidence": evidence})
-        result = score_saved(path)
+        selection = select_windows(args.task, obs, windows, folder)
+        matching = match_windows(args.task, obs, selection, times, cap, folder)
+        # Expert execution and new JEV check judgments/scoring await authorization.
+        # The new expert proposals must not be fed to the legacy collector.
+        result = {"status": "awaiting_expert_execution", "score": None,
+                  "selection_file": "02-selected-windows.json",
+                  "matching_file": "03-window-matching.json",
+                  "matched_window_count": len(matching["windows"]),
+                  "selected_windows": selection["selected_windows"]}
         result["elapsed_seconds"] = time.monotonic() - started
         save(folder / "result.json", result)
         return result
