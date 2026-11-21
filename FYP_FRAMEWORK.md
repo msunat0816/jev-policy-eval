@@ -2,31 +2,41 @@
 
 ## 当前执行规格 · 第一轮 · 2026-11-21
 
-目标为单条 RoboRewardBench 视频的四阶段离线评价：VLM 粗看与完整 checklist → JEV 选窗 → VLM 匹配 check/expert → 工具取证后 JEV 逐 check 判断与终局评分。2026-11-21 用户已批准加入第三步，当前入口运行至 VLM 匹配，保存后返回 `awaiting_expert_execution`；expert 执行与新版判断/评分须先获允许再修改。第 1–12 节保留 10 月的研究方案，涉及选型、预算、循环补看和对比实验时以本节为准。
+目标链路采用用户确认的顺序：VLM 粗看与完整 checklist → JEV 选窗 → YOLO 候选前置 → 匹配 VLM 关联窗口/check/expert 并选择候选编号完成实体绑定 → 使用已有候选做几何及调用短窗口运动 → 逐 check 证据包 → JEV 图文逐 check 判断 → JEV 纯文字终评。第 1–12 节保留历史研究方案，涉及选型、预算、循环补看和对比实验时以本节为准。
 
-**已确认的 VLM 粗看定位：结合原始 instruction 和稀疏采样帧，逐帧描述机器人操作、相关对象及未知，并生成完整 checklist。** 看似已完成、失败、不可见或缺乏工具覆盖的要求均保留对应问题，不做窗口匹配。保留现有 `requirements / frames / candidate_checks` 字段及候选框格式，`candidate_checks` 现在表示完整 checklist。完整实际 prompt 见 [prompts/qwen_coarse_observation.txt](prompts/qwen_coarse_observation.txt)。
+2026-11-21 第 1–6 步已在本地完成，本次只接续实现第 7 步，不 push。全部 check 判断完成后，程序汇总原始 instruction、完整任务要求、RoboReward A.2.2 完整五档 rubric、全部 check 答案及已有证据摘要/原帧与 PTS 范围/未解决事项，一次纯文字 JEV Choice 选择 `level_1…level_5` 或 `insufficient_evidence`。程序只映射所选等级为 1–5 或 null，不按 yes 比例评分、不把 unknown 当 no、不因任意 unknown 强制弃答。用户确认空选择/全 unknown 仍请求终评；接口或解析失败保留记录并停止，不重试或自动改分。第 1–6 步行为和两个 expert 算法不变。
 
-实现进度：粗看、`jev-window-selection-v2` 选窗和 `vlm-window-check-expert-v1` 匹配已落地。匹配模型暂定 `qwen3.8-flash`，契约/校验在 `vlm_matching.py`，独立 prompt 为 `prompts/qwen_window_matching.txt`，视频读取和调用在 `evaluate_rollout.py::match_windows()`。本机 51 项离线检查全部通过，模型响应均为模拟；用户已授权提交并推送至 `first-delivery`，远端验证以该分支对应的 Actions 结果为准。旧 CPU 取证、受限适配 A 和评分函数保留，当前入口不调用，不能视为新版下游。精确行为与旧实现边界见 [README](README.md)。
+[`experts/`](experts/README.md) 的两个独立算法接口保留：YOLO26 end-to-end ONNX Runtime CPU 分割，以及 mask 内金字塔 LK/前后向检查。两个 expert 算法与第 4 步调度保持不变；第 5 步只读取已有输出。候选类别不是任务实体身份，帧内编号不是跨帧身份；二维框/mask 和运动也不直接证明三维支撑、抓取、释放或放稳。
 
-| 步骤 | 本轮行为 |
+| 步骤 | 当前行为与状态 |
 |---|---|
-| 输入 | 从官方数据取得原始视频、任务指令、split 和样本 ID。评估入口只接收这些信息，参考分在预测保存后关联。 |
-| 粗观察 | 采样和模型配置不变：每 2 秒取每个非空时间段的第一帧，另保留末帧，无 8 帧上限；`qwen3.8-flash` 非思考模式一次读取 instruction、所有采样图片及帧号/PTS。输出自然语言要求、逐帧可见内容/未知/候选框，以及覆盖全部任务要求的 checklist。 |
-| 选窗 | 相邻采样帧定义窗口。完整 instruction、requirements、checklist 及全部逐帧粗观察作为共享 state；不提交候选框或 expert 能力。`jev-1.14.0` 一次批量请求，每窗口一个独立 Choice：0 无关、1 相关但重复、2 值得细看、3 核心歧义/矛盾/撤销。所有 ≥2 的窗口入选，可为零、无上限，末段采用相同规则。related_frames 不限制可选窗口。不匹配 check、不指派 expert、不判完成。空 checklist 或未覆盖全部 requirement ID 时在调用前报错；此检查不保证语义完整。 |
-| 选窗输出 | `02-selected-windows.json` 保存协议、阈值、全部窗口判断与选中列表；每窗口含原始 ID、帧范围、优先级、是否入选。原始请求/响应保存在 `02-select-windows.json`。非法或缺失选择报错，不伪造配对/工具结果。 |
-| VLM 匹配 | 每个选中窗口一次 `qwen3.8-flash` 非思考 JSON 请求，读取窗口内全部连续原始帧（包含两端），带原帧号/PTS，不另设采样上限。上下文含原 instruction、全部 requirements/checklist 和两类 expert 契约。每个 check 返回 related/unrelated/uncertain、原因、expert 提议和限制；expert 提议含 ID、check 实体、取证帧和原因。不回答 check，不评分。空选择不调用匹配 API。 |
-| 匹配契约与输出 | `object_spatial` 描述 YOLO nano 分割/ONNX CPU，`short_window_motion` 描述金字塔 LK 光流，两者均标记 not_implemented，只作未来执行提议。校验选窗一致性、完整 checklist 引用及窗口/check/expert/实体/帧引用；拒绝旧 layout/motion 和 completion verdict。图片在 matching_frames/窗口ID/；原调用 trace、逐窗口匹配和总匹配分别保存为 03-match-窗口ID.json、03-matching-窗口ID.json、03-window-matching.json。总匹配标记 proposals_only，不能当作工具证据。 |
-| 工具取证（待更新） | 对象与空间、短窗口运动 expert 的新版实现尚未接入；现有模板匹配和二维测量代码仅作为旧实现保留。 |
-| 判断与终分（待更新） | 工具执行后按每个 check 综合其相关窗口证据给一次 yes/no/unknown，再结合原 instruction、完整任务要求、答案和证据按 rubric 给分；不足以区分等级时返回 insufficient_evidence。 |
+| 输入 | 原始视频、instruction、split、样本 ID，以及显式本地分割 ONNX 路径。参考分在预测保存后关联。 |
+| 粗观察（已接入） | 原采样/模型/prompt 不变：每 2 秒取每个非空时间段的第一帧，另保留末帧；`qwen3.8-flash` 非思考模式读取 instruction、稀疏帧及帧号/PTS，输出逐帧描述、自然语言要求和完整 checklist。不选窗、不指派 expert、不删减不可见要求。 |
+| 选窗（已接入） | 相邻采样帧定义窗口；`jev-1.14.0` 根据全部文字背景一次批量请求，每窗口一个 0–3 Choice，所有 ≥2 的窗口入选，末段采用同一规则。完整 checklist 校验、模型配置、`jev-window-selection-v2` 和输出格式不变。 |
+| YOLO 候选（已接入） | `generate_candidates()` 校验选窗/checklist/PTS，读取全部已选窗口原始帧的并集，只分割一次，跳过未入选间隔。通过既有 `ObjectSpatialExpert` 在 CPU 执行；逐帧处理，不累积全部原图。保存候选编号、检测类别/分数、原始像素框、无损 mask、原帧号/PTS 和模型来源。候选保持未绑定，不选 check、不答题、不评分。 |
+| 候选输出 | `03-yolo-candidates.json`：`yolo-window-candidates-v1`、全帧去重策略、`binding_status=unbound`、模型 SHA256/类别表/运行库/阈值等来源；`windows` 保留原窗口 ID/范围/完整帧号并引用去重后的 `frames`。无检测和空 mask 如实保留；空选择不加载分割器、不读候选帧；解码/推理失败不写完成态汇总。 |
+| 匹配 VLM（已接入） | 每个选中窗口一次 `qwen3.8-flash` 非思考 JSON 请求，读取全部连续原图/PTS、独立框/mask 轮廓/编号图与类别/分数元数据。结合原 instruction、完整要求/checklist 同时关联窗口/check/expert 并选择该帧候选编号绑定实体。不选窗、不改 check、不回答 check、不评分。 |
+| 匹配契约与输出 | `vlm-window-check-expert-bindings-v2` 严格输出 window_id/checks/bindings；每个 check 一条相关性记录。窗口级绑定按实体＋帧唯一，bound 引用真实候选，missing 为 null 并说明原因，跨 check 复用。空间提议绑定每个所需实体/帧；运动只绑定起始帧，显式写 target_entity_key、motion_mode 和相对模式的 reference_entity_key。角色不明不猜；角色明确但 mask/候选缺失保留提议及原因。程序校验所有引用和帧/mask 一致性，保存 PTS/模型/请求/候选来源；不执行 expert、不重跑 YOLO。 |
+| 使用 expert（已接入） | `expert_execution.py` 在执行前复用既有契约验证全部窗口/check/expert/实体/候选/帧/PTS/来源引用。按绑定取出已有框/mask 做同帧二维几何；按提议区间首帧的显式目标/参考 mask 创建 `MaskSeed`，读取全部连续原帧并调用 LK，不重复 YOLO。目标 mask 缺失不执行跟踪；用户确认参考缺失时保留目标绝对运动，相对运动记缺测。点不足/中断保留原输出，不补点/插值。每个提议保存一条关联窗口/check/实体与来源的执行记录；覆盖状态不当作 check 答案。 |
+| 逐 check 证据包（已接入） | `evidence_packaging.py` 对每个原 check 汇集 related/uncertain 窗口的全部连续原图引用，重叠原帧去重并保留所有来源及候选标注图引用；保留绑定/限制/缺测。几何按执行/实体对计算 min/max/最后有效值及帧/PTS；运动分别计算目标/参考/相对的首个/最后有效及最大 from-seed 位移、覆盖和中断，不拼接不同 seed。原始长数组只留执行文件引用；空选择/纯图片 check 也保留包。 |
+| 显式阈值（已接入） | 用户确认可选 `--threshold-config` JSON，严格指定窗口/check/expert、实体角色、量/单位、比较符号/数值、原始帧范围。只支持既有二维距离/间隙、IoU、mask 交集面积和 from-seed 位移模长。区间极值要求同次执行逐帧完整测量；缺测不补齐、不拼接，返回 not_comparable/null，不当 false；未配置不猜阈值。比较不附加容差，也不输出 check 答案。 |
+| JEV 图文逐 check 判断（已接入） | 每个有证据的 check 一个独立请求/Choice，读取全部 related/uncertain 窗口的去重原图＋候选编号图、原帧/PTS、绑定、算术摘要和缺测，输出 yes/no/unknown；不分窗投票。空证据由程序明确记 unknown，不冒充模型回答。prompt 区分曾经/终局/持续，工具缺测或数值可用均不机械决定答案。 |
+| 图片与调用（用户已确认） | 固定 jev-1.14.0，使用官方 assets 与图像请求头；完整 canvas 等比缩小至最长边 ≤1568，短边不足 280 时补边，另存图片及变换/来源哈希，不改原坐标。逐 check 一次，超限/接口/解析失败保留 trace/已完成判断并停止，不删帧/重试。原始长数组不送模型，输入材料不自动标为支持证据。 |
+| 纯文字终评（本次接入） | `final_evaluation.py` 校验全部 check 判断完整且来源一致，程序整理完整原 instruction/要求/rubric/答案及窗口/绑定/测量摘要/时间覆盖/未解决记录，单次纯文字 JEV 选择等级或 insufficient_evidence。仅映射等级，不自动改分；全 unknown 仍调用；失败留档停止。 |
 
-入口和旧 CPU 工具在 `evaluate_rollout.py`，粗观察 prompt 与校验在 `coarse_observation.py`，选窗和匹配契约分别在 `window_selection.py`、`vlm_matching.py`。环境需要 Python 3.11+、OpenCV、NumPy、ffprobe，本轮无新增依赖。真实调用前须核对 `DASHSCOPE_API_KEY`、`TYPESAFE_API_KEY` 和香港工作空间的完整兼容 `DASHSCOPE_BASE_URL`，不打印密钥、不静默回退新加坡。**旧端点回退行为沿用，本轮没有真实模型验收。** 以下保留调用格式，当前运行只到 VLM 匹配，输出目录须为新目录。
+入口为 `evaluate_rollout.py`，粗观察/选窗及匹配契约分别在 `coarse_observation.py`、`window_selection.py`、`vlm_matching.py`、`expert_execution.py`、`evidence_packaging.py`、`check_judgment.py` 和 `final_evaluation.py`。运行环境为 Python 3.11+、ffprobe 和 `requirements-experts.txt`；完整离线检查安装 `requirements-experts-test.txt`。本地 ONNX 模型合约见 [expert 说明](experts/README.md)，不自动下载。真实 VLM/JEV 调用前仍须核对香港端点和密钥；本次未修改端点回退逻辑，未进行付费调用。
 
 ```sh
 python evaluate_rollout.py --video "$ROLLOUT_VIDEO" --task "$ROLLOUT_TASK" \
-  --episode "$ROLLOUT_SAMPLE_ID" --split test --out run-001
+  --episode "$ROLLOUT_SAMPLE_ID" --split test --out run-001 \
+  --yolo-model /absolute/path/yolo26n-seg.onnx
 ```
 
-当前运行保留 `run.json`（视频哈希、采样/时间映射、模型、选窗/匹配协议与全帧策略）、粗看/匹配 JPEG、粗观察 JSON、逐调用请求/响应、选窗和逐窗口/总匹配文件、`result.json`。结果状态为 `awaiting_expert_execution`，`score=null`，含选窗/匹配文件路径、选中窗口及匹配窗口数；不调用旧取证/评分，不写 `03-evidence.json`。非法匹配报错且不自动重试，已有 trace 和已完成窗口记录保留。Qwen 粗观察看过首尾，因此未来生成严格前缀监督时仍须排除未来信息。RoboRewardBench 的 test 样本保留作评测。
+当前运行保留 `run.json`（视频哈希、时间映射、采样/选窗/候选/匹配协议、原图及候选图策略、第 4 步执行协议/缺参考策略、第 5 步证据/阈值配置及来源哈希、第 6 步模型/图像/空包/零重试/prompt 哈希、第 7 步模型/纯文字/全 unknown 仍调用/零重试/rubric 与 prompt 哈希）、粗看 JPEG/JSON、所有调用 trace、选窗、YOLO 候选、逐窗口/总匹配、`04-expert-execution.json`、`05-check-evidence.json`、`06-check-judgments.json`、`07-final-materials.json`、`07-evaluate.json`、`07-final-evaluation.json` 与 `result.json`。既有图片保存在 matching_frames/窗口ID/，第 6 步适配图另存 check_frames/cXXXX/；原文件不覆盖，图像大小变换、文件哈希、帧/PTS 和 UUID 引用写入判断/调用记录。结果含选窗/候选/匹配文件路径、选中窗口、检测帧数、候选总数、匹配窗口数、执行文件/记录数、证据文件/check 包数、判断文件/check 数/实际 JEV 判断调用数、终评材料/结果文件/所选等级/一次终评调用数与耗时。最终状态为 scored（1–5）或 insufficient_evidence（null）。终评 Choice 不被解释为自由文本理由，材料引用不自动标为支持证据。执行记录含提议、帧/PTS、绑定来源、测量/缺测、原始结果，交给第 5 步汇总；第 5 步不回答 check 或评分，第 6 步在全部图文材料上做一次结构化判断；空选择不加载运动 expert。解码/尺寸/记录校验错误不写相应完成态汇总或终结果，已有上游文件保留，视频句柄释放。空选择不读取匹配帧或请求 VLM，匹配和逐 check 非法响应保留 trace，不重试、不补造结果；`collect()`、`track_pair()`、`score_saved()` 和旧证据格式保留但不调用。Qwen 粗观察看过首尾，因此未来生成严格前缀监督时仍须排除未来信息。RoboRewardBench test 保留作评测。
+
+第 7 步新增 14 项、更新两处入口集成回归后，153 项离线测试全部通过，无跳过；覆盖单次纯文字/完整记录汇总、全 unknown、直接等级映射、结构化元数据隔离、上游完整性与来源校验、HTTP/解析失败零重试及第 6 步保留/视频释放。完整终评接口与文件见 [README 第 7 步](README.md#当前-jev-纯文字终评计划第-7-步)。未调用真实 VLM/JEV、未验收真实终评分级质量、未运行 Actions、未 push。
+
+历史第 5 步 123 项离线测试通过；第 6 步 139 项全部通过，无跳过（新增 16 项并更新主入口/候选集成回归）。环境为 Python 3.14.6、OpenCV 4.14.0、NumPy 2.5.5、ONNX Runtime 1.32.0、ONNX 1.23.2。实际 JPEG/缩放/补边及合成编号图目视检查，模拟 HTTP 验证图像附件/请求头/引用、逐 check 上下文隔离、多窗口一次判断、空包及图像足以判断时的工具缺测处理、Choice 元数据、图片/请求体/上下文错误和部分完成留档/资源释放；既有合成 ONNX CPU 与实际 LK 回归保持通过，不重跑 expert。未调用真实 VLM/JEV、未验收真实 JEV 图像与时间语义质量，未运行新 Actions，未 push。接口与范围详见 [README](README.md) 和 [官方图像文档](https://docs.typesafe.ai/images)。
 
 ### 粗观察的时间间隔与输入成本
 
@@ -36,7 +46,7 @@ RoboRewardBench 的官方 test 清单有 2,831 条。逐文件读取 MP4 视频�
 
 ### 粗观察里“候选框”的含义
 
-例如“把米色积木放到托盘左侧的柱子上”，Qwen 可以给“米色积木”和“左侧柱子”各一个候选框 `[x1,y1,x2,y2]`，横纵轴归一化到 0–1000。该字段为兼容现有 schema 保留，对象被遮挡或身份不清时可省略。当前选窗只读文字粗观察，不读候选框，也不运行跟踪。旧 `collect()` 仍以窗口起始帧中的两个框作模板，但它已从当前入口断开；新版 expert 尚未实现。两个框靠近或重叠仅是二维线索，无法据此证明积木已插到柱子上。
+例如“把米色积木放到托盘左侧的柱子上”，Qwen 可以给“米色积木”和“左侧柱子”各一个候选框 `[x1,y1,x2,y2]`，横纵轴归一化到 0–1000。该字段为兼容现有 schema 保留，对象被遮挡或身份不清时可省略。当前选窗只读文字粗观察，不读候选框，也不运行跟踪。旧 `collect()` 仍以窗口起始帧中的两个框作模板，但它已从当前入口断开；新版分割候选保持未绑定，匹配 VLM 的任务实体绑定另存并交给第 4 步执行。两个框靠近或重叠仅是二维线索，无法据此证明积木已插到柱子上。
 
 VeriPhy 区分测量、学习型子判断和三值结论。其对象细类、动作事件和深度次序仍有学习型核验；本项目采用其带类型和来源的证据设计，并自行选择 JEV 终局评分。[VeriPhy §4.3](https://arxiv.org/html/2609.03153v1#S4.SS3)、[RoboReward 附录 A.2.2](https://arxiv.org/html/2601.00675v2)、[JEV 接口](https://docs.typesafe.ai/models)
 

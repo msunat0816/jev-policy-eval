@@ -1,0 +1,13 @@
+{
+  "id": "roboreward-end-of-episode-a2.2-v1",
+  "source": "https://arxiv.org/html/2601.00675v2",
+  "attribution": "Lee et al., RoboReward, arXiv:2601.00675v2, Appendix A.2.2. Definitions faithfully restated; no additional grading rules.",
+  "scope": "Evaluate the state at the end of the episode. Disregard time limits.",
+  "grades": {
+    "level_1": "No Success: At termination, nothing has changed in a way relevant to the instructed goal.",
+    "level_2": "Minimal Progress: The outcome advances the goal slightly, but that advance is inadequate.",
+    "level_3": "Partial Completion: Substantial progress is present at termination, while at least two requirements remain unmet, or one unmet requirement is major.",
+    "level_4": "Near Completion: The outcome has the intended region and intent, with exactly one minor requirement unmet.",
+    "level_5": "Perfect Completion: Every requirement is met in the terminal state."
+  }
+}

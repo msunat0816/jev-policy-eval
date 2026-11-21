@@ -1,77 +1,101 @@
-You match one selected robot-video window to a complete task checklist
-and the supplied expert capability contracts.
+Match one selected robot-video window to the complete task checklist and
+bind task entities to supplied, already generated YOLO candidate IDs.
 
-INPUT
+INPUT AND LIMITS
 
-You receive the original instruction, all task requirements, the complete
-checklist, one selected window's original ID and frame range, the expert
-catalog, and chronological images labelled with original frame IDs and
-presentation timestamps. All original frames in this window, including
-both endpoints, are supplied. You have not seen unprovided windows.
+You receive the original instruction, all requirements, the complete
+checklist, the selected window ID/range, the expert catalog, candidate
+metadata, and ALL chronological original frames in the window (including
+both endpoints) with original frame IDs and presentation timestamps.
+Each original image is followed by a separate annotated view of that same
+frame: boxes, mask outlines, full candidate IDs, and a class/score ledger.
+The original image is authoritative when annotations obscure details.
+Candidate masks already exist; do not propose rerunning YOLO.
 
-The original instruction is authoritative. Checklist rationales and
-earlier apparent results are proposals, not verified evidence. Consider
-every check, even if its related_frames point outside this window.
-Do not select or change windows, add checks, rename entities, answer a
-check, or assign a completion grade.
+Use the instruction as authoritative. Do not select/change windows,
+add/remove checks, rename or invent entity keys, answer checks, or score.
+Checklist rationales are proposals, not verified completion evidence.
+Consider every check, including those citing observations outside this
+window. You have not seen unprovided windows.
 
-YOUR TASK
+ASSOCIATIONS
 
-For every checklist check, decide whether this window contains relevant
-evidence or a meaningful opportunity to obtain it:
-- related: the window bears on the check, even if the check cannot yet
-  be answered or the evidence only covers part of it.
-- unrelated: no relevance to this check is supported in this window.
-- uncertain: visibility, identity or temporal context prevents deciding
-  the window's relevance. Explain the specific uncertainty.
+Return exactly one relevance entry for every check:
+- related: this window bears on the check, even if only partially.
+- unrelated: relevance is not supported here; experts must be empty.
+- uncertain: visibility, identity or temporal context prevents deciding.
+Explain uncertainty in limitations. Related checks without useful expert
+coverage also need limitations; retain these checks with empty experts.
+Choose only experts in the catalog, at most once per check. These are
+proposals for the next stage; geometry and motion have NOT been executed.
+No 2D box/mask overlap or local motion establishes 3D support, contact,
+grasp, release, stability or episode-wide task completion by itself.
 
-Then propose which of the listed experts could provide useful evidence
-for that check here. The catalog describes planned contracts: entries
-marked not_implemented are not runnable. Your output is a routing
-proposal for a future executor, never an assertion that a tool ran.
-Do not substitute the old layout/template-tracking tools, invent tools,
-tool outputs, masks, detections, feature points or execution success.
+ENTITY BINDINGS
 
-Object/spatial evidence is limited to the detector's fixed classes and
-2D observations. Do not assume it detects a gripper, peg or arbitrary lab
-prop. Motion needs reliable masks, sufficient texture and continuous
-frames; record missing prerequisites and possible camera motion. A mask
-may later come from object_spatial only where the class and detection
-are supported. Do not invent such support or a reference region.
+A candidate ID such as f120:d1 identifies a detection ONLY in frame 120.
+It is not a cross-frame identity. Detection classes and scores do not
+establish which object the instruction means; two apples remain distinct
+candidates. Use the instruction and temporal visual context to choose.
+Never invent candidates, boxes, masks, class support or execution results.
+The fixed detector vocabulary may miss grippers, pegs and lab props.
 
-Keep relevant checks even when no expert can help; use an empty experts
-array and explain the capability gap in limitations. Uncertain relevance
-also requires a nonempty limitations array. Unrelated checks must have
-an empty experts array. Proposing an expert does not mean it verifies
-the complete check. Neither 2D overlap nor local motion proves 3D
-support, grasp, release, stability or episode-wide task completion.
+Use one shared binding per (entity_key, frame_id) in this window, reusable
+across checks. Supply exactly the bindings required by the proposals:
+- object_spatial: every proposed entity in every proposed frame.
+- short_window_motion: target, and reference for relative motion, ONLY
+  at the proposed interval's FIRST frame; later frames are tracking input,
+  not a demand to bind every frame. Do not include unused extra bindings.
+
+Each binding must contain exactly:
+- entity_key: an unchanged key declared by the complete checklist.
+- frame_id: the supplied original frame ID.
+- status: bound or missing.
+- candidate_id: an existing ID in that exact frame for bound; null for
+  missing. If no candidate fits or identity is ambiguous, use missing.
+- reason: a concise visual basis for the selection or specific reason
+  why binding is missing. Never guess from class name alone.
+
+A clear box/identity may be bound even when mask_status is empty. This
+does not make a usable tracking seed; retain that mask limitation. Do not
+turn a missing binding into a check verdict or delete the associated
+expert proposal solely because its binding is missing.
+
+EXPERT PROPOSALS
+
+object_spatial proposals must contain exactly:
+- expert_id: object_spatial.
+- entity_keys: distinct keys declared by this check, at least one.
+- frame_ids: distinct supplied frames in chronological order.
+- reason: why using these existing candidates/2D geometry would help,
+  with its partial scope and limitations.
+
+short_window_motion proposals must contain exactly:
+- expert_id: short_window_motion.
+- target_entity_key: an explicit target declared by this check.
+- motion_mode: absolute or relative (image-plane motion).
+- reference_entity_key: null for absolute; an explicit distinct entity
+  declared by this check for relative. Do not infer roles from list order.
+- frame_ids: EVERY original frame of the proposed continuous interval,
+  in order, with at least two frames. The first frame supplies the seeds.
+- reason: why this motion evidence would help this check, with its scope.
+
+For relative motion, explicitly identify the reference. Target/reference
+must not bind to the same candidate. If a role cannot be identified, do
+not invent it: retain the related check, omit the unsupported proposal and
+explain the role uncertainty in limitations. If roles are explicit but a
+seed binding is missing, keep the proposal and the missing binding/reason.
+Motion additionally needs reliable masks, textured points and continuous
+frames; record empty masks, occlusion and possible camera motion. This
+stage neither judges mask reliability as an execution guarantee nor runs
+tracking or replaces missing data with zero motion.
 
 OUTPUT
 
-Return only one JSON object with exactly these fields:
-- window_id: the supplied window ID.
-- checks: exactly one entry for every checklist check, with no duplicates.
-
-Each checks entry must contain exactly:
-- check_id: an existing checklist ID, unchanged.
-- relevance: related, unrelated or uncertain.
-- reason: a concise explanation grounded in this window and the check.
-- experts: an array of expert proposals, possibly empty.
-- limitations: an array of specific uncertainties, missing prerequisites
-  or capability limits; use an empty array only when appropriate.
-
-Each expert proposal must contain exactly:
-- expert_id: a supplied catalog key; each expert appears at most once
-  per check. These are planned calls, not completed executions.
-- entity_keys: one or more distinct entity keys from this check.
-- frame_ids: distinct supplied frame IDs in chronological order. For
-  object_spatial, choose the necessary individual frames. For
-  short_window_motion, include every frame in the proposed continuous
-  interval, with at least two frames; the interval's two ends must not
-  be interpreted as sufficient tracking input by themselves.
-- reason: why that expert's evidence would help this check, specifying
-  its partial scope when it cannot establish the whole requirement.
-
-Do not include yes/no/unknown check answers, scores, boxes, masks or tool
-measurements. Use concise English and no Markdown or reasoning transcript.
-The context and labelled window images follow.
+Return only one JSON object with exactly window_id, checks, bindings.
+window_id must match the supplied window. Each checks entry must contain
+exactly check_id, relevance, reason, experts, limitations. All check IDs
+must occur exactly once. limitations is an array of strings.
+Do not include check answers, grades, measurements, boxes or mask arrays.
+Use concise English, no Markdown and no reasoning transcript.
+The context and labelled image pairs follow.

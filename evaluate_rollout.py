@@ -1,4 +1,4 @@
-"""Run coarse VLM observation, JEV window selection and VLM check/expert matching."""
+"""Run observation, bound experts, per-check judgments and text-only final grading."""
 import argparse
 import base64
 import hashlib
@@ -8,18 +8,33 @@ import os
 from pathlib import Path
 import subprocess
 import time
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
 
+from candidate_presentation import render_candidates
 from coarse_observation import OBSERVE, SCHEMA_VERSION, parse_observation
+from check_judgment import (CRITERIA as CHECK_CRITERIA, EVIDENCE_FILE, IMAGE_HEADERS, JEV_URL,
+                            JUDGMENT_MODEL, JUDGMENT_PROMPT, JUDGMENT_PROTOCOL, MAX_BODY_BYTES,
+                            build_check_request, has_usable_measurements, parse_check_response,
+                            validate_judgment_inputs)
+from experts import ObjectSpatialExpert, VideoFrame
+from expert_execution import EXECUTION_PROTOCOL, execute_proposals
+from evidence_packaging import (PACKAGING_PROTOCOL, build_evidence_packages,
+                                validate_threshold_config)
+from final_evaluation import (CRITERIA as FINAL_CRITERIA, EVALUATION_FILE, FINAL_MODEL, FINAL_PROMPT,
+                              FINAL_PROTOCOL, JUDGMENT_FILE, MATERIALS_FILE, REQUEST_FILE,
+                              RUBRIC, RUBRIC_PATH, build_final_materials, build_final_request,
+                              parse_final_response)
 from measurement_adapter import (ADAPTER_VERSION, LAYOUT_MARGIN_PX, adapt_requirement, requirement_states,
                                  requirement_verdict)
 from window_selection import (SELECTION_PROTOCOL, WINDOW_THRESHOLD, build_selection_request,
                               summarize_selection)
-from vlm_matching import (EXPERT_CATALOG, MATCHING_MODEL, MATCHING_PROMPT, MATCHING_PROTOCOL,
-                          matching_context, parse_window_matching, validate_matching_inputs)
+from vlm_matching import (CANDIDATE_FRAME_POLICY, CANDIDATE_PROTOCOL, EXPERT_CATALOG, MATCHING_MODEL,
+                          MATCHING_PROMPT, MATCHING_PROTOCOL, matching_context, parse_window_matching,
+                          validate_candidate_inputs, validate_matching_inputs)
 
 
 CONFIG = {"match_min": 0.82, "peak_margin": 0.08, "min_gray_std": 8,
@@ -100,7 +115,7 @@ QWEN = "qwen3.8-flash"
 JEV = "jev-1.14.0"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 2.0
 # Legacy collection helpers below retain their existing measurements. They are not
-# called by the current entry point, which stops after matching, before experts.
+# called by the current entry point, which uses the new evidence/judgment chain.
 MEASUREMENTS = {
     "layout": "Signed image-plane box separation at the window's final frame.",
     "motion": "Maximum 2D relative-center excursion from the window's first frame, over the window.",
@@ -121,20 +136,33 @@ def save(path, obj):
     tmp.replace(path)
 
 
-def post(url, key, body, folder, name, *, image_directory="frames"):
-    raw = json.dumps(body, ensure_ascii=False)
+def post(url, key, body, folder, name, *, image_directory="frames", headers=None, image_assets=None, max_body_bytes=None):
+    raw = json.dumps(body, ensure_ascii=False, allow_nan=False)
     # Persist the exact prompt; JPEG files are stored separately from the text trace.
     body_log = json.loads(raw)
     for msg in body_log.get("messages", []):
         for part in msg["content"]:
             if part.get("type") == "image_url":
                 part["image_url"] = f"JPEGs in {image_directory}/, in prompt order"
+    for reference, asset in body_log.get("assets", {}).items():
+        metadata = (image_assets or {}).get(reference, {})
+        if "data_base64" in asset:
+            asset["data_base64"] = f"Image bytes in {metadata.get('prepared_file', image_directory)}; see image_assets manifest"
     call = {"url": url, "request": body_log, "attempt": 1, "cache": "no_client_cache"}
+    if headers:
+        call["headers"] = dict(headers)
+    if image_assets is not None:
+        call["image_assets"] = image_assets
     path = folder / (name + ".json")
     start = time.monotonic()
     try:
-        req = Request(url, raw.encode(), {"Authorization": "Bearer " + key,
-                                         "Content-Type": "application/json"})
+        data = raw.encode()
+        if max_body_bytes is not None:
+            call["request_bytes"] = len(data)
+            if len(data) > max_body_bytes:
+                raise ValueError("JEV check request exceeds the 32 MiB body limit; no frames dropped and no request sent")
+        req = Request(url, data, {"Authorization": "Bearer " + key,
+                                 "Content-Type": "application/json", **(headers or {})})
         with urlopen(req, timeout=120) as response:
             result = json.load(response)
         call["response"] = result
@@ -142,6 +170,18 @@ def post(url, key, body, folder, name, *, image_directory="frames"):
         return result
     except Exception as exc:
         call["error"] = str(exc)
+        if isinstance(exc, HTTPError):
+            call["status_code"] = exc.code
+            try:
+                message = exc.read().decode("utf-8", errors="replace")
+                try:
+                    call["response_error"] = json.loads(message)
+                except json.JSONDecodeError:
+                    call["response_error"] = message
+            except Exception as read_error:
+                call["response_error_unavailable"] = str(read_error)
+            finally:
+                exc.close()
         raise
     finally:
         call["seconds"] = time.monotonic() - start
@@ -226,28 +266,73 @@ def select_windows(task, obs, windows, folder):
     return selection
 
 
-def match_windows(task, obs, selection, times, cap, folder):
+def generate_candidates(task, obs, selection, times, cap, folder, model_path):
+    """Detect every selected original frame once, without task-entity binding."""
+    # Reuse the existing selection/checklist/PTS boundary; this makes no VLM call.
     selected = validate_matching_inputs(task, obs, selection, times)
+    windows = [{"window_id": w["id"], "frame_range": list(w["frame_range"]),
+                "frame_ids": list(range(w["frame_range"][0], w["frame_range"][1] + 1))}
+               for w in selected]
+    frame_ids = sorted({index for window in windows for index in window["frame_ids"]})
+    expert = ObjectSpatialExpert(model_path) if frame_ids else None
+    records, last_result = [], None
+    previous = None
+    for index in frame_ids:
+        # Sequential reads within each selected interval; skip unselected gaps.
+        if previous is None or index != previous + 1:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+        ok, image = cap.read()
+        if not ok:
+            raise ValueError(f"candidate video decode failed at frame {index}")
+        # Process one original-resolution image at a time, retaining only JSON data.
+        last_result = expert.infer([VideoFrame(index, times[index], image)])
+        records.extend(last_result["frames"])
+        previous = index
+    result = {"protocol": CANDIDATE_PROTOCOL, "expert_id": "object_spatial",
+              "status": "candidates_generated" if frame_ids else "no_selected_windows",
+              "frame_policy": CANDIDATE_FRAME_POLICY, "binding_status": "unbound",
+              "expert_protocol": last_result["protocol"] if last_result else None,
+              "provenance": last_result["provenance"] if last_result else None,
+              "limitations": last_result["limitations"] if last_result else [],
+              "windows": windows, "frames": records}
+    save(folder / "03-yolo-candidates.json", result)
+    return result
+
+
+def match_windows(task, obs, selection, times, cap, folder, candidates):
+    """Associate checks/experts and bind supplied candidates, without executing experts."""
+    selected = validate_matching_inputs(task, obs, selection, times)
+    by_frame = validate_candidate_inputs(candidates, selected, times)
     matched = []
     for window in selected:
         first, last = window["frame_range"]
         frame_ids = list(range(first, last + 1))
+        candidate_frames = [by_frame[index] for index in frame_ids]
         image_directory = f"matching_frames/{window['id']}"
         (folder / image_directory).mkdir(parents=True, exist_ok=False)
         content = [{"type": "text", "text": MATCHING_PROMPT + "\nContext: "
-                    + json.dumps(matching_context(task, obs, window), ensure_ascii=False)}]
+                    + json.dumps(matching_context(task, obs, window, candidate_frames), ensure_ascii=False)}]
+        images = []
         cap.set(cv2.CAP_PROP_POS_FRAMES, first)
         for index in frame_ids:
-            ok, image = cap.read()
+            ok, original = cap.read()
             if not ok:
                 raise ValueError(f"matching video decode failed at frame {index}")
-            ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 88])
-            if not ok:
-                raise ValueError(f"matching JPEG encoding failed at frame {index}")
-            (folder / image_directory / f"{index}.jpg").write_bytes(jpeg.tobytes())
-            content.append({"type": "text", "text": f"frame {index}, PTS {times[index]} seconds"})
-            content.append({"type": "image_url", "image_url": {
-                "url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}})
+            annotated = render_candidates(original, by_frame[index])
+            image_record = {"frame_id": index, "pts_seconds": times[index]}
+            for kind, image, filename in (("original", original, f"{index}.jpg"),
+                                          ("candidates", annotated, f"{index}-candidates.jpg")):
+                quality = 88 if kind == "original" else 95
+                ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                if not ok:
+                    raise ValueError(f"matching JPEG encoding failed at frame {index}")
+                relative = f"{image_directory}/{filename}"
+                (folder / relative).write_bytes(jpeg.tobytes())
+                image_record[kind + "_file"] = relative
+                content.append({"type": "text", "text": f"frame {index}, PTS {times[index]} seconds; {kind}"})
+                content.append({"type": "image_url", "image_url": {
+                    "url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}})
+            images.append(image_record)
         name = f"03-match-{window['id']}"
         base = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
         response = post(base.rstrip("/") + "/chat/completions", os.environ["DASHSCOPE_API_KEY"],
@@ -256,18 +341,105 @@ def match_windows(task, obs, selection, times, cap, folder):
                          "messages": [{"role": "user", "content": content}]}, folder, name,
                         image_directory=image_directory)
         result = parse_window_matching(response["choices"][0]["message"]["content"], window,
-                                       obs["candidate_checks"], frame_ids)
+                                       obs["candidate_checks"], frame_ids, candidate_frames)
+        source = {"method": "matching_vlm_candidate_selection", "model": MATCHING_MODEL,
+                  "request_file": name + ".json", "candidate_file": "03-yolo-candidates.json"}
+        bindings = [{**binding, "pts_seconds": times[binding["frame_id"]], "source": dict(source)}
+                    for binding in result["bindings"]]
         record = {"window_id": window["id"], "frame_range": [first, last],
                   "frame_ids": frame_ids, "pts_seconds": [times[i] for i in frame_ids],
-                  "image_directory": image_directory, "request_file": name + ".json",
-                  "checks": result["checks"]}
+                  "image_directory": image_directory, "images": images, "request_file": name + ".json",
+                  "candidate_file": "03-yolo-candidates.json", "checks": result["checks"], "bindings": bindings}
         save(folder / f"03-matching-{window['id']}.json", record)
         matched.append(record)
     matching = {"protocol": MATCHING_PROTOCOL, "model": MATCHING_MODEL,
-                "status": "proposals_only", "task": task, "requirements": obs["requirements"],
-                "checklist": obs["candidate_checks"], "expert_catalog": EXPERT_CATALOG, "windows": matched}
+                "status": "proposals_and_bindings_only", "task": task, "requirements": obs["requirements"],
+                "checklist": obs["candidate_checks"], "expert_catalog": EXPERT_CATALOG,
+                "candidate_file": "03-yolo-candidates.json", "windows": matched}
     save(folder / "03-window-matching.json", matching)
     return matching
+
+
+def execute_experts(task, obs, selection, times, cap, folder, candidates, matching):
+    """Execute validated proposals using saved candidates; never rerun segmentation."""
+    execution = execute_proposals(task, obs, selection, times, cap, candidates, matching)
+    save(folder / "04-expert-execution.json", execution)
+    return execution
+
+
+def package_evidence(task, obs, selection, times, folder, candidates, matching, execution, threshold_config=None):
+    """Save per-check summaries/references without expert reruns or model calls."""
+    packages = build_evidence_packages(task, obs, selection, times, candidates, matching, execution, threshold_config)
+    save(folder / "05-check-evidence.json", packages)
+    return packages
+
+
+def judge_checks(task, obs, selection, times, folder, candidates, matching, execution, packages):
+    """One image/text Choice per check; empty evidence is explicitly program unknown."""
+    validate_judgment_inputs(task, obs, selection, times, candidates, matching, execution, packages)
+    judgments = []
+    for index, packet in enumerate(packages["packages"]):
+        started = time.monotonic()
+        name = f"06-judge-c{index:04d}"
+        record = {"check_id": packet["check_id"], "check": packet["check"],
+                  "evidence_file": EVIDENCE_FILE, "package_index": index,
+                  "provided_evidence": {"window_ids": [w["window_id"] for w in packet["windows"]],
+                                        "measurement_ids": [m["id"] for m in packet["measurements"]],
+                                        "image_coverage": packet["image_coverage"]},
+                  "request_file": None, "image_assets": {}}
+        try:
+            if not packet["images"] and not has_usable_measurements(packet):
+                record.update(answer="unknown", answer_source="program_no_evidence",
+                              reason="no_images_or_usable_measurements", actual_model=None,
+                              confidence=None, probabilities=None, usage=None)
+            else:
+                body, manifest = build_check_request(packet, packages["episode"], folder, index)
+                record.update(request_file=name + ".json", image_assets=manifest)
+                response = post(JEV_URL, os.environ["TYPESAFE_API_KEY"], body, folder, name,
+                                headers=IMAGE_HEADERS if body.get("assets") else None,
+                                image_assets=manifest, max_body_bytes=MAX_BODY_BYTES)
+                record.update(parse_check_response(response, packet["check_id"]), answer_source="jev", reason=None)
+            record["elapsed_seconds"] = time.monotonic() - started
+            save(folder / f"06-check-c{index:04d}.json", record)
+            judgments.append(record)
+        except Exception as exc:
+            save(folder / f"06-failed-c{index:04d}.json",
+                 {"check_id": packet["check_id"], "evidence_file": EVIDENCE_FILE, "package_index": index,
+                  "request_file": record["request_file"], "error_type": type(exc).__name__, "error": str(exc),
+                  "elapsed_seconds": time.monotonic() - started})
+            raise
+    result = {"protocol": JUDGMENT_PROTOCOL, "model": JUDGMENT_MODEL, "status": "checks_judged",
+              "instruction": task, "requirements": obs["requirements"], "checklist": obs["candidate_checks"],
+              "evidence_file": EVIDENCE_FILE, "judgments": judgments,
+              "jev_call_count": sum(j["answer_source"] == "jev" for j in judgments)}
+    save(folder / "06-check-judgments.json", result)
+    return result
+
+
+def evaluate_final(task, obs, selection, times, folder, candidates, matching, execution, packages, judgments):
+    """One text-only JEV rubric selection after every check has been judged."""
+    started = time.monotonic()
+    try:
+        validate_judgment_inputs(task, obs, selection, times, candidates, matching, execution, packages)
+        materials = build_final_materials(task, obs, packages, judgments)
+        save(folder / MATERIALS_FILE, materials)
+        response = post(JEV_URL, os.environ["TYPESAFE_API_KEY"], build_final_request(materials),
+                        folder, Path(REQUEST_FILE).stem)
+        result = {"protocol": FINAL_PROTOCOL, "model": FINAL_MODEL,
+                  **parse_final_response(response), "materials_file": MATERIALS_FILE,
+                  "evidence_file": EVIDENCE_FILE, "judgment_file": JUDGMENT_FILE,
+                  "request_file": REQUEST_FILE, "rubric_id": RUBRIC["id"],
+                  "jev_call_count": 1, "elapsed_seconds": time.monotonic() - started}
+        save(folder / EVALUATION_FILE, result)
+        return result
+    except Exception as exc:
+        save(folder / "07-failed.json", {"protocol": FINAL_PROTOCOL,
+             "materials_file": MATERIALS_FILE if (folder / MATERIALS_FILE).is_file() else None,
+             "judgment_file": JUDGMENT_FILE,
+             "request_file": REQUEST_FILE if (folder / REQUEST_FILE).is_file() else None,
+             "error_type": type(exc).__name__, "error": str(exc),
+             "elapsed_seconds": time.monotonic() - started})
+        raise
 
 
 def collect(cap, task, obs, windows, routes, times, size):
@@ -381,6 +553,12 @@ def score_saved(path):
 
 def run(args, *, sample_interval_seconds=DEFAULT_SAMPLE_INTERVAL_SECONDS):
     started = time.monotonic()
+    model_path = Path(args.yolo_model)
+    if model_path.suffix.lower() != ".onnx" or not model_path.is_file():
+        raise ValueError("provide a local .onnx segmentation model; no automatic downloads")
+    threshold_path = getattr(args, "threshold_config", None)
+    threshold_bytes = Path(threshold_path).read_bytes() if threshold_path is not None else None
+    threshold_config = validate_threshold_config(json.loads(threshold_bytes) if threshold_bytes is not None else None)
     times = frame_times(args.video)
     indices = overview_indices(times, sample_interval_seconds)
     windows = list(zip(indices, indices[1:])) or [(0, 0)]
@@ -403,20 +581,68 @@ def run(args, *, sample_interval_seconds=DEFAULT_SAMPLE_INTERVAL_SECONDS):
                                   "choices_per_window": ["priority"],
                                   "context": "full_checklist_and_all_coarse_observations",
                                   "threshold": WINDOW_THRESHOLD},
+             "candidate_generation": {"protocol": CANDIDATE_PROTOCOL,
+                                      "model_path": str(model_path.resolve()),
+                                      "frame_policy": CANDIDATE_FRAME_POLICY,
+                                      "entity_binding": False},
              "vlm_matching": {"protocol": MATCHING_PROTOCOL, "model": MATCHING_MODEL,
-                              "frames": "all_original_frames_inclusive",
-                              "calls": "one_per_selected_window", "expert_execution": False},
-             "execution_scope": "coarse_observation_window_selection_and_matching",
-             "protocol": SCHEMA_VERSION + "; " + SELECTION_PROTOCOL + "; " + MATCHING_PROTOCOL})
+                              "enabled": True, "frames": "all_original_frames_inclusive",
+                              "candidate_views": "original_and_annotated_per_frame",
+                              "calls": "one_per_selected_window", "downstream_execution": True},
+             "expert_execution": {"protocol": EXECUTION_PROTOCOL, "enabled": True,
+                                  "segmentation": "reuse_saved_candidates",
+                                  "motion_frames": "all_continuous_proposed_original_frames",
+                                  "missing_reference": "track_target_keep_relative_missing",
+                                  "check_judgments": False, "grading": False},
+             "evidence_packaging": {"protocol": PACKAGING_PROTOCOL, "enabled": True,
+                                    "window_relevance": ["related", "uncertain"],
+                                    "images": "all_related_window_original_frames_deduplicated",
+                                    "raw_measurements": "file_references_only",
+                                    "threshold_config": threshold_config,
+                                    "threshold_source": ({"path": str(Path(threshold_path).resolve()),
+                                                          "sha256": hashlib.sha256(threshold_bytes).hexdigest()}
+                                                         if threshold_bytes is not None else None),
+                                    "check_judgments": False, "grading": False},
+             "check_judgment": {"protocol": JUDGMENT_PROTOCOL, "model": JUDGMENT_MODEL, "enabled": True,
+                                "images": "all_package_frames_original_and_candidate_views",
+                                "image_preparation": "shrink_max_1568_pad_min_280_preserve_full_canvas",
+                                "calls": "one_per_check_with_evidence", "empty_evidence": "program_unknown",
+                                "choices": list(CHECK_CRITERIA), "retries": 0, "grading": False,
+                                "prompt_sha256": hashlib.sha256(JUDGMENT_PROMPT.encode()).hexdigest()},
+             "final_evaluation": {"protocol": FINAL_PROTOCOL, "model": FINAL_MODEL, "enabled": True,
+                                  "input": "text_only_program_assembled_materials",
+                                  "calls": "one_after_all_checks_including_all_unknown", "retries": 0,
+                                  "choices": list(FINAL_CRITERIA), "rubric_id": RUBRIC["id"],
+                                  "rubric_source": RUBRIC["source"],
+                                  "rubric_sha256": hashlib.sha256(RUBRIC_PATH.read_bytes()).hexdigest(),
+                                  "prompt_sha256": hashlib.sha256(FINAL_PROMPT.encode()).hexdigest()},
+             "execution_scope": "coarse_observation_selection_candidates_matching_experts_packages_check_judgments_and_final_evaluation",
+             "protocol": "; ".join((SCHEMA_VERSION, SELECTION_PROTOCOL, CANDIDATE_PROTOCOL,
+                                       MATCHING_PROTOCOL, EXECUTION_PROTOCOL, PACKAGING_PROTOCOL, JUDGMENT_PROTOCOL, FINAL_PROTOCOL))})
         obs = observe(args.task, indices, times, cap, folder)
         selection = select_windows(args.task, obs, windows, folder)
-        matching = match_windows(args.task, obs, selection, times, cap, folder)
-        # Expert execution and new JEV check judgments/scoring await authorization.
-        # The new expert proposals must not be fed to the legacy collector.
-        result = {"status": "awaiting_expert_execution", "score": None,
+        candidates = generate_candidates(args.task, obs, selection, times, cap, folder, model_path)
+        matching = match_windows(args.task, obs, selection, times, cap, folder, candidates)
+        execution = execute_experts(args.task, obs, selection, times, cap, folder, candidates, matching)
+        packages = package_evidence(args.task, obs, selection, times, folder, candidates, matching, execution, threshold_config)
+        judgments = judge_checks(args.task, obs, selection, times, folder, candidates, matching, execution, packages)
+        final = evaluate_final(args.task, obs, selection, times, folder, candidates, matching, execution, packages, judgments)
+        result = {"status": final["status"], "score": final["score"], "jev_choice": final["jev_choice"],
+                  "final_evaluation_file": EVALUATION_FILE, "final_materials_file": MATERIALS_FILE,
+                  "jev_final_call_count": final["jev_call_count"],
                   "selection_file": "02-selected-windows.json",
+                  "candidate_file": "03-yolo-candidates.json",
                   "matching_file": "03-window-matching.json",
+                  "execution_file": "04-expert-execution.json",
+                  "evidence_file": "05-check-evidence.json",
+                  "check_evidence_count": len(packages["packages"]),
+                  "judgment_file": "06-check-judgments.json",
+                  "check_judgment_count": len(judgments["judgments"]),
+                  "jev_check_call_count": judgments["jev_call_count"],
+                  "expert_execution_count": len(execution["records"]),
                   "matched_window_count": len(matching["windows"]),
+                  "candidate_frame_count": len(candidates["frames"]),
+                  "candidate_count": sum(len(frame["candidates"]) for frame in candidates["frames"]),
                   "selected_windows": selection["selected_windows"]}
         result["elapsed_seconds"] = time.monotonic() - started
         save(folder / "result.json", result)
@@ -432,6 +658,10 @@ if __name__ == "__main__":
     parser.add_argument("--episode", required=True)
     parser.add_argument("--split", required=True, choices=["train", "validation", "test"])
     parser.add_argument("--out", type=Path, required=True, help="new run directory")
+    parser.add_argument("--yolo-model", type=Path, required=True,
+                        help="local end-to-end segmentation ONNX model (e.g. YOLO26n-seg); CPU only")
+    parser.add_argument("--threshold-config", type=Path,
+                        help="optional explicit numeric comparison JSON; no inferred or default task thresholds")
     parser.add_argument("--sample-interval-seconds", type=float, default=DEFAULT_SAMPLE_INTERVAL_SECONDS,
                         help="seconds between coarse time samples (default: 2; include endpoints)")
     args = parser.parse_args()
