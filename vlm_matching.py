@@ -11,6 +11,7 @@ from window_selection import build_selection_request, summarize_selection
 CANDIDATE_PROTOCOL = "yolo-window-candidates-v1"
 CANDIDATE_FRAME_POLICY = "all_selected_window_frames_inclusive_deduplicated"
 MATCHING_PROTOCOL = "vlm-window-check-expert-bindings-v2"
+EMPTY_CANDIDATE_BINDING_METHOD = "program_empty_candidate_inventory"
 MATCHING_MODEL = "qwen3.8-flash"
 MATCHING_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "qwen_window_matching.txt"
 MATCHING_PROMPT = MATCHING_PROMPT_PATH.read_text(encoding="utf-8")
@@ -177,8 +178,13 @@ def validate_candidate_inputs(candidates, selected, times):
     return {frame["frame_id"]: frame for frame in frames}
 
 
-def parse_window_matching(response_text, window, checklist, frame_ids, candidate_frames):
-    """Parse associations and explicit candidate bindings; never answer checks."""
+def parse_window_matching(response_text, window, checklist, frame_ids, candidate_frames, *, cleanup_audit=None):
+    """Validate matching; an audit collector permits conservative normalization.
+
+    The default remains strict for saved downstream inputs. All supplied bindings
+    must be valid and unique. Omitted required bindings can only be supplied as
+    missing when the validated candidate inventory explicitly has no detections.
+    """
     value = json.loads(response_text)
     _fields(value, ("window_id", "checks", "bindings"), "window matching")
     if value["window_id"] != window["id"]:
@@ -273,7 +279,20 @@ def parse_window_matching(response_text, window, checklist, frame_ids, candidate
                 needed.update((entity, frame) for entity in expert_entities for frame in frames)
     if seen != set(checks):
         raise ValueError("matching: every checklist check needs exactly one relevance entry")
-    if set(bindings) != needed:
+    original_count = len(bindings)
+    added = []
+    if cleanup_audit is not None:
+        # Absence of an inventory record is not evidence of an empty candidate list.
+        empty_frames = {frame["frame_id"] for frame in candidate_frames
+                        if frame.get("status") == "no_detections" and frame["candidates"] == []}
+        for entity, frame in sorted(needed - set(bindings)):
+            if frame in empty_frames:
+                binding = {"entity_key": entity, "frame_id": frame, "status": "missing",
+                           "candidate_id": None,
+                           "reason": "No candidates were detected in this frame; missing binding added from the candidate inventory."}
+                bindings[(entity, frame)] = binding
+                added.append(binding)
+    if needed - set(bindings) or (cleanup_audit is None and set(bindings) != needed):
         raise ValueError("matching: exactly one bound/missing binding is required per proposed entity/frame")
     for item in value["checks"]:
         for expert in item["experts"]:
@@ -282,4 +301,22 @@ def parse_window_matching(response_text, window, checklist, frame_ids, candidate
                 a, b = (bindings[(expert[role], first)] for role in ("target_entity_key", "reference_entity_key"))
                 if a["status"] == b["status"] == "bound" and a["candidate_id"] == b["candidate_id"]:
                     raise ValueError("matching: motion target and reference cannot bind the same candidate")
+    removed = [binding for key, binding in bindings.items() if key not in needed]
+    if removed or added:
+        value["bindings"] = [binding for key, binding in bindings.items() if key in needed]
+        # Recheck the normalized response using the same strict downstream contract.
+        parse_window_matching(json.dumps(value), window, checklist, frame_ids, candidate_frames)
+    if removed:
+        cleanup_audit.append({"warning": "unused_bindings_removed", "window_id": value["window_id"],
+                              "reason": "Bindings are not required by any expert proposal in this window.",
+                              "original_count": original_count, "retained_count": len(value["bindings"]),
+                              "removed_bindings": removed})
+    if added:
+        cleanup_audit.append({"warning": "missing_bindings_added_for_empty_frames", "window_id": value["window_id"],
+                              "method": EMPTY_CANDIDATE_BINDING_METHOD,
+                              "reason": "Required bindings were omitted for frames with no detected candidates.",
+                              "original_count": original_count, "retained_count": len(value["bindings"]),
+                              "added_bindings": added,
+                              "evidence": [{"frame_id": frame, "status": "no_detections", "candidate_count": 0}
+                                           for frame in sorted({b["frame_id"] for b in added})]})
     return value

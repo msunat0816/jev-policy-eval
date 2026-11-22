@@ -3,6 +3,7 @@ import argparse
 import base64
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -32,7 +33,7 @@ from measurement_adapter import (ADAPTER_VERSION, LAYOUT_MARGIN_PX, adapt_requir
                                  requirement_verdict)
 from window_selection import (SELECTION_PROTOCOL, WINDOW_THRESHOLD, build_selection_request,
                               summarize_selection)
-from vlm_matching import (CANDIDATE_FRAME_POLICY, CANDIDATE_PROTOCOL, EXPERT_CATALOG, MATCHING_MODEL,
+from vlm_matching import (CANDIDATE_FRAME_POLICY, CANDIDATE_PROTOCOL, EMPTY_CANDIDATE_BINDING_METHOD, EXPERT_CATALOG, MATCHING_MODEL,
                           MATCHING_PROMPT, MATCHING_PROTOCOL, matching_context, parse_window_matching,
                           validate_candidate_inputs, validate_matching_inputs)
 
@@ -340,16 +341,35 @@ def match_windows(task, obs, selection, times, cap, folder, candidates):
                          "response_format": {"type": "json_object"},
                          "messages": [{"role": "user", "content": content}]}, folder, name,
                         image_directory=image_directory)
+        cleanup_audit = []
         result = parse_window_matching(response["choices"][0]["message"]["content"], window,
-                                       obs["candidate_checks"], frame_ids, candidate_frames)
+                                       obs["candidate_checks"], frame_ids, candidate_frames,
+                                       cleanup_audit=cleanup_audit)
+        cleanup_file = None
+        if cleanup_audit:
+            cleanup_file = f"03-matching-{window['id']}-binding-cleanup.json"
+            save(folder / cleanup_file, {"protocol": "matching-binding-cleanup-v1",
+                                        "request_file": name + ".json", "candidate_file": "03-yolo-candidates.json",
+                                        "warnings": cleanup_audit,
+                                        "normalized_response": result})
+            logging.getLogger(__name__).warning(
+                "matching %s: removed %d unused bindings, added %d missing bindings for empty frames; audit: %s",
+                window["id"], sum(len(event.get("removed_bindings", [])) for event in cleanup_audit),
+                sum(len(event.get("added_bindings", [])) for event in cleanup_audit), cleanup_file)
         source = {"method": "matching_vlm_candidate_selection", "model": MATCHING_MODEL,
                   "request_file": name + ".json", "candidate_file": "03-yolo-candidates.json"}
-        bindings = [{**binding, "pts_seconds": times[binding["frame_id"]], "source": dict(source)}
+        added_keys = {(b["entity_key"], b["frame_id"]) for event in cleanup_audit
+                      for b in event.get("added_bindings", [])}
+        program_source = {**source, "method": EMPTY_CANDIDATE_BINDING_METHOD, "model": None}
+        bindings = [{**binding, "pts_seconds": times[binding["frame_id"]],
+                     "source": dict(program_source if (binding["entity_key"], binding["frame_id"]) in added_keys else source)}
                     for binding in result["bindings"]]
         record = {"window_id": window["id"], "frame_range": [first, last],
                   "frame_ids": frame_ids, "pts_seconds": [times[i] for i in frame_ids],
                   "image_directory": image_directory, "images": images, "request_file": name + ".json",
                   "candidate_file": "03-yolo-candidates.json", "checks": result["checks"], "bindings": bindings}
+        if cleanup_file:
+            record["binding_cleanup_file"] = cleanup_file
         save(folder / f"03-matching-{window['id']}.json", record)
         matched.append(record)
     matching = {"protocol": MATCHING_PROTOCOL, "model": MATCHING_MODEL,

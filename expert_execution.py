@@ -8,7 +8,7 @@ import cv2
 from experts import MaskSeed, ShortWindowMotionExpert, VideoFrame
 from experts.geometry import pairwise_spatial_evidence
 from experts.masks import decode_mask
-from vlm_matching import (MATCHING_MODEL, MATCHING_PROTOCOL, parse_window_matching,
+from vlm_matching import (EMPTY_CANDIDATE_BINDING_METHOD, MATCHING_MODEL, MATCHING_PROTOCOL, parse_window_matching,
                           validate_candidate_inputs, validate_matching_inputs)
 
 
@@ -58,11 +58,21 @@ def validate_execution_inputs(task, obs, selection, times, candidates, matching)
         raw_bindings = []
         fields = ("entity_key", "frame_id", "status", "candidate_id", "reason")
         for binding in bindings:
+            if not isinstance(binding, dict):
+                raise ValueError("execution: invalid binding PTS/source reference")
+            binding_source = expected_source
+            frame_id = binding.get("frame_id")
+            frame = by_frame.get(frame_id) if type(frame_id) is int else None
+            if (binding.get("status") == "missing" and binding.get("candidate_id") is None
+                    and frame is not None and frame["status"] == "no_detections" and frame["candidates"] == []
+                    and isinstance(binding.get("source"), dict)
+                    and binding["source"].get("method") == EMPTY_CANDIDATE_BINDING_METHOD):
+                binding_source = {**expected_source, "method": EMPTY_CANDIDATE_BINDING_METHOD, "model": None}
             if (not isinstance(binding, dict) or set(binding) != {*fields, "pts_seconds", "source"}
                     or type(binding.get("frame_id")) is not int or binding["frame_id"] not in ids
                     or type(binding.get("pts_seconds")) not in (int, float)
                     or binding["pts_seconds"] != times[binding["frame_id"]]
-                    or binding.get("source") != expected_source):
+                    or binding.get("source") != binding_source):
                 raise ValueError("execution: invalid binding PTS/source reference")
             raw_bindings.append({field: binding[field] for field in fields})
         raw = {"window_id": record["window_id"], "checks": record.get("checks"), "bindings": raw_bindings}

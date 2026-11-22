@@ -20,12 +20,50 @@ window. You have not seen unprovided windows.
 
 ASSOCIATIONS
 
+Judge whether this window can help assess the check, not whether the
+check's condition is satisfied. Supporting AND contradicting observations
+can both be relevant. Lack of support for a condition does not make a
+window unrelated. Describe the evidence connection without answering the
+check or declaring a requirement satisfied, violated, true or false.
+
 Return exactly one relevance entry for every check:
-- related: this window bears on the check, even if only partially.
-- unrelated: relevance is not supported here; experts must be empty.
-- uncertain: visibility, identity or temporal context prevents deciding.
-Explain uncertainty in limitations. Related checks without useful expert
-coverage also need limitations; retain these checks with empty experts.
+- related: the window provides usable clues about the check's objects,
+  event or temporal condition, even partially or in a contrary direction.
+- unrelated: the window provides no usable connection to the check's
+  objects, event or temporal condition; experts must be empty.
+- uncertain: visibility, identity or temporal context prevents deciding
+  whether the window provides such a connection. Uncertainty about the
+  check's final answer alone is not a reason to mark relevance uncertain.
+If a connection is clear but its interpretation is ambiguous, use related
+and explain that ambiguity in limitations. Explain uncertain relevance in
+limitations as well.
+
+Make these decisions in order:
+1. Assess relevance from the original images and supplied temporal context.
+2. Decide which available experts could provide useful partial evidence.
+3. Bind only the entity/frame pairs required by those expert proposals.
+Missing YOLO detections, low detector scores or lack of useful expert
+coverage do not by themselves make a window unrelated or uncertain.
+Related checks without useful expert coverage need limitations; retain
+these checks with empty experts. If an expert is useful but its required
+candidate is unavailable, retain the proposal with a missing binding,
+subject to the explicit-role rules below. Do not force an expert proposal
+when no available expert would provide useful evidence.
+
+Relevance examples (illustrative; do not copy these into the output):
+- A check concerns an object's initial support. A supplied initial frame
+  appears to show a different support: related, because initial placement
+  bears on the check. Explain identity/occlusion limits; do not issue a verdict.
+- An early window shows initial placement for a check about later removal:
+  related to the initial state, with a limitation that subsequent removal
+  is outside this window. Do not infer the unseen later event.
+- An object is visually identifiable but has no YOLO candidate: its visible
+  placement may still be related; missing detections limit expert coverage.
+- Object identity or timing is too unclear to establish any connection:
+  uncertain. If some usable connection remains, use related with limitations.
+- The window has no usable information about the check's objects, event
+  or temporal condition, and that lack of connection is clear: unrelated.
+
 Choose only experts in the catalog, at most once per check. These are
 proposals for the next stage; geometry and motion have NOT been executed.
 No 2D box/mask overlap or local motion establishes 3D support, contact,
@@ -46,6 +84,15 @@ across checks. Supply exactly the bindings required by the proposals:
 - short_window_motion: target, and reference for relative motion, ONLY
   at the proposed interval's FIRST frame; later frames are tracking input,
   not a demand to bind every frame. Do not include unused extra bindings.
+
+Only create bindings after deciding the expert proposals for every check.
+If every check has experts: [], return bindings: []. Visible entities alone
+do not require bindings. Take the union of required (entity_key, frame_id)
+pairs across all proposals, and include each pair exactly once.
+An empty candidate list does NOT mean bindings should be empty. For every
+required pair in a no_detections frame, return status: missing with
+candidate_id: null and a reason. A limitations entry does not replace a
+required binding. Keep the expert proposal; do not invent a candidate.
 
 Each binding must contain exactly:
 - entity_key: an unchanged key declared by the complete checklist.
@@ -91,6 +138,17 @@ stage neither judges mask reliability as an execution guarantee nor runs
 tracking or replaces missing data with zero motion.
 
 OUTPUT
+
+BINDING EXAMPLES (illustrative IDs only; always use the actual input IDs)
+
+No expert proposals:
+{"window_id":"w0","checks":[{"check_id":"c0","relevance":"related","reason":"The window is relevant but the available experts cannot resolve the check.","experts":[],"limitations":["No useful expert coverage."]}],"bindings":[]}
+
+Two checks sharing the same required entity/frame use ONE binding:
+{"window_id":"w0","checks":[{"check_id":"c0","relevance":"related","reason":"Local object geometry is relevant.","experts":[{"expert_id":"object_spatial","entity_keys":["apple"],"frame_ids":[0],"reason":"Inspect the object's 2D extent."}],"limitations":["2D evidence only."]},{"check_id":"c1","relevance":"related","reason":"The same object geometry is relevant.","experts":[{"expert_id":"object_spatial","entity_keys":["apple"],"frame_ids":[0],"reason":"Reuse the same object's 2D extent."}],"limitations":["2D evidence only."]}],"bindings":[{"entity_key":"apple","frame_id":0,"status":"bound","candidate_id":"f0:d0","reason":"Visual appearance and context identify the apple."}]}
+
+Expert proposal retained, but frame 0 has status no_detections and candidates []:
+{"window_id":"w0","checks":[{"check_id":"c0","relevance":"related","reason":"The visible object placement bears on the check.","experts":[{"expert_id":"object_spatial","entity_keys":["apple","bowl"],"frame_ids":[0],"reason":"Propose 2D object geometry, with missing inputs explicitly recorded."}],"limitations":["No candidates were detected; spatial measurements will be missing."]}],"bindings":[{"entity_key":"apple","frame_id":0,"status":"missing","candidate_id":null,"reason":"No candidates were detected in frame 0."},{"entity_key":"bowl","frame_id":0,"status":"missing","candidate_id":null,"reason":"No candidates were detected in frame 0."}]}
 
 Return only one JSON object with exactly window_id, checks, bindings.
 window_id must match the supplied window. Each checks entry must contain

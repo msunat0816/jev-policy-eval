@@ -17,7 +17,10 @@ JUDGMENT_PROTOCOL = "jev-per-check-image-text-v1"
 JUDGMENT_MODEL = "jev-1.14.0"
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
 EVIDENCE_FILE = "05-check-evidence.json"
-IMAGE_HEADERS = {"TypeSafe-Danger-Zone-Images": "true"}
+IMAGE_HEADERS = {
+    "TypeSafe-Danger-Zone-Images": "true",
+    "TypeSafe-Danger-Zone-Long-Context": "true",
+}
 MIN_SIDE, MAX_SIDE = 280, 1568
 MAX_IMAGE_BYTES = 16 * 1024 * 1024
 MAX_BODY_BYTES = 32 * 1024 * 1024
