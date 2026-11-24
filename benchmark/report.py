@@ -7,7 +7,8 @@ from zoneinfo import ZoneInfo
 
 from .common import digest, read_json, write_json
 from .data import duration_bin, load_dataset
-from .metrics import evaluate
+from .direct_jev import METHOD
+from .metrics import evaluate, quality, token_counts
 
 
 def joined_rows(dataset, run, phase):
@@ -16,7 +17,11 @@ def joined_rows(dataset, run, phase):
     if configuration["plan_sha256"] != digest(Path(dataset) / "plan.json"):
         raise ValueError("run was not created from this dataset plan")
     from .common import object_hash
-    ids = set(plan["pilot_ids"] if phase == "pilot" else plan["development_ids"])
+    pilot_ids = configuration.get("pilot_ids", plan["pilot_ids"])
+    if (len(pilot_ids) != plan["pilot_size"] or len(set(pilot_ids)) != len(pilot_ids)
+            or not set(pilot_ids).issubset(plan["development_ids"])):
+        raise ValueError("run pilot IDs do not match the validation plan")
+    ids = set(pilot_ids if phase == "pilot" else plan["development_ids"])
     rows = []
     for sample in inputs:
         if sample["sample_id"] not in ids:
@@ -46,6 +51,41 @@ def joined_rows(dataset, run, phase):
                      "origin_group": reference["origin_group"], "task_group": reference["task_group"],
                      "duration_s": duration, "duration_bin": duration_bin(duration)})
     return plan, configuration, rows
+
+
+def compare_runs(dataset, direct_run, framework_run, out):
+    _, direct_config, direct_rows = joined_rows(dataset, direct_run, "development")
+    _, framework_config, framework_rows = joined_rows(dataset, framework_run, "development")
+    if direct_config.get("method") != METHOD or framework_config.get("method", "framework") != "framework":
+        raise ValueError("expected a direct-jev run and a framework run")
+    rubric_file = "prompts/roboreward_rubric.json"
+    rubric = direct_config["framework"]["files"][rubric_file]
+    if rubric != framework_config["framework"]["files"][rubric_file]:
+        raise ValueError("direct-jev and framework rubric files differ")
+    direct_model = read_json(Path(direct_run) / "runtime.json")["models"]["jev"]
+    framework_model = read_json(Path(framework_run) / "runtime.json")["models"]["jev"]
+    if direct_model != framework_model:
+        raise ValueError("direct-jev and framework JEV model versions differ")
+    paired_direct, paired_framework = [], []
+    for direct, framework in zip(direct_rows, framework_rows, strict=True):
+        if direct["sample_id"] != framework["sample_id"]:
+            raise ValueError("runs use different validation IDs")
+        if (direct.get("video_sha256") and framework.get("video_sha256")
+                and direct["video_sha256"] != framework["video_sha256"]):
+            raise ValueError(f"runs have different videos for {direct['sample_id']}")
+        if direct["status"] == framework["status"] == "scored":
+            paired_direct.append(direct)
+            paired_framework.append(framework)
+    direct_mae = quality(paired_direct)["selective_mae"]
+    framework_mae = quality(paired_framework)["selective_mae"]
+    result = {"plan_sha256": direct_config["plan_sha256"], "rubric_sha256": rubric, "jev_model": direct_model,
+              "direct_run_configuration": direct_config, "framework_run_configuration": framework_config,
+              "direct_jev": evaluate(direct_rows), "framework": evaluate(framework_rows),
+              "both_scored": {"n": len(paired_direct), "sample_ids": [row["sample_id"] for row in paired_direct],
+                              "direct_mae": direct_mae, "framework_mae": framework_mae,
+                              "direct_minus_framework_mae": None if direct_mae is None else direct_mae - framework_mae}}
+    write_json(out, result)
+    return {"comparison": str(Path(out).resolve()), "both_scored": result["both_scored"]}
 
 
 def display(value):
@@ -79,7 +119,7 @@ def confusion_svg(matrix):
 
 
 def create_report(dataset, run, out=None, *, phase="development", iterations=2000, rates=None):
-    plan, configuration, rows = joined_rows(dataset, run, phase)
+    _, configuration, rows = joined_rows(dataset, run, phase)
     out = Path(out) if out else Path(run) / "reports" / phase
     if (Path(run) / "freeze.json").exists() and out.resolve().is_relative_to((Path(run) / "frozen-report").resolve()):
         raise ValueError("cannot overwrite the sealed development report")
@@ -91,14 +131,30 @@ def create_report(dataset, run, out=None, *, phase="development", iterations=200
     metrics["configuration"] = configuration
     metrics["pricing_rates"] = rates
     write_json(out / "metrics.json", metrics)
+    direct = configuration.get("method") == METHOD
     columns = ("sample_id", "source", "reward", "status", "score", "absolute_error", "duration_s",
                "elapsed_seconds", "failed_stage", "error_type", "error", "origin_group", "task")
+    if direct:
+        columns += ("sampled_frame_ids", "sampled_images", "request_attempted", "request_bytes",
+                    "request_elapsed_seconds", "input_tokens", "output_tokens")
     with (out / "predictions.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         for row in rows:
             values = {k: row.get(k) for k in columns}
             values["absolute_error"] = abs(row["score"] - row["reward"]) if row["status"] == "scored" else None
+            if direct:
+                sampling = row.get("sampling")
+                if sampling:
+                    values.update(sampled_images=sampling["image_count"],
+                                  sampled_frame_ids=" ".join(str(frame["frame_id"]) for frame in sampling["frames"]))
+                calls = row.get("calls", [])
+                if calls:
+                    call = calls[0]
+                    input_tokens, output_tokens = token_counts(call.get("usage"))
+                    values.update(request_attempted=call["transport_attempted"], request_bytes=call["request_bytes"],
+                                  request_elapsed_seconds=call.get("elapsed_seconds"),
+                                  input_tokens=input_tokens, output_tokens=output_tokens)
             # Prevent spreadsheet formula execution from task or error strings.
             for key, value in values.items():
                 if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
@@ -109,9 +165,9 @@ def create_report(dataset, run, out=None, *, phase="development", iterations=200
     (out / "confusion.svg").write_text(svg, encoding="utf-8")
     parts = ['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">',
              '<title>JEV validation 开发评估</title><style>body{font:16px/1.6 system-ui;margin:36px auto;max-width:1200px;padding:0 20px;color:#18314f;background:#f7f9fc}table{border-collapse:collapse;background:white;margin:16px 0;width:100%}th,td{border:1px solid #dce3ed;padding:8px;text-align:left;overflow-wrap:anywhere}th{background:#eaf0f8}svg{max-width:440px;width:100%}.note{padding:14px;background:#fff3d6}h1{font-size:28px}h2{margin-top:32px}code{overflow-wrap:anywhere}</style>',
-             '<h1>JEV validation 开发评估</h1>',
-             '<p class="note">这是 validation 子集的探索性结果，不能作为 RoboRewardBench test 榜单成绩。未运行、失败和弃答均保留；已评分 MAE 必须结合覆盖率阅读。此报告不包含 baseline、消融或长程专项审核。</p>',
-             f'<p>阶段：{html.escape(phase)} · 样本：{len(rows)} · 来源：{plan["source_count"]} · 生成时间：{html.escape(metrics["generated_at_hong_kong"])}</p>',
+             '<h1>JEV 直接图像评分 · validation 开发评估</h1>' if direct else '<h1>JEV validation 开发评估</h1>',
+             '<p class="note">这是 validation 子集的探索性结果，不能作为 RoboRewardBench test 榜单成绩。未运行、失败和弃答均保留；已评分 MAE 必须结合覆盖率阅读。</p>',
+             f'<p>阶段：{html.escape(phase)} · 样本：{len(rows)} · 来源：{len({r["source"] for r in rows})} · 生成时间：{html.escape(metrics["generated_at_hong_kong"])}</p>',
              table(["指标", "值"], [("计划样本", q["n"]), ("已尝试", metrics["attempted"]),
                    ("完成（含弃答）", metrics["completed"]), ("数值评分覆盖率", q["coverage"]),
                    ("已评分 MAE", q["selective_mae"]), ("全覆盖 MAE（仅全部有分时）", q["all_sample_mae"]),

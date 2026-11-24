@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 # Executed by absolute path from a neutral working directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark.common import now, read_json, write_json
+from benchmark.direct_jev import METHOD, prepare_request, score_request
 
 
 STAGES = ("observe", "select_windows", "generate_candidates", "match_windows",
@@ -25,30 +26,36 @@ def main():
     parser.add_argument("--job", type=Path)
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--yolo-model", type=Path)
+    parser.add_argument("--method", choices=("framework", METHOD), default="framework")
     args = parser.parse_args()
+    direct = args.method == METHOD
     sys.path.insert(0, str(args.framework_root.resolve()))
     ev = importlib.import_module("evaluate_rollout")
     if Path(ev.__file__).resolve() != args.framework_root.resolve() / "evaluate_rollout.py":
         raise ValueError("imported a different framework entry point")
     if args.probe:
         versions = {}
-        for package in ("numpy", "opencv-python-headless", "onnxruntime", "onnx"):
+        packages = ("numpy", "opencv-python-headless")
+        for package in packages if direct else (*packages, "onnxruntime", "onnx"):
             try:
                 versions[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
                 versions[package] = None
         # onnx is a test-only dependency; runtime requires ONNX Runtime.
-        importlib.import_module("onnxruntime")
-        if args.yolo_model:
+        if not direct:
+            importlib.import_module("onnxruntime")
+        if args.yolo_model and not direct:
             ev.ObjectSpatialExpert(args.yolo_model)
         print(json.dumps({"python": sys.version, "versions": versions,
-                          "models": {"qwen": ev.QWEN, "jev": ev.JEV},
+                          "models": {"jev": ev.FINAL_MODEL} if direct else {"qwen": ev.QWEN, "jev": ev.JEV},
                           "entry_point": str(Path(ev.__file__).resolve()),
-                          "onnx_model_initialized": bool(args.yolo_model)}))
+                          "onnx_model_initialized": bool(args.yolo_model) and not direct}))
         return
     job = read_json(args.job)
-    expected = {"video", "task", "episode", "split", "out", "yolo_model",
-                "threshold_config", "sample_interval_seconds", "max_calls", "timeout_seconds"}
+    expected = {"video", "task", "episode", "split", "out",
+                "sample_interval_seconds", "max_calls", "timeout_seconds"}
+    if not direct:
+        expected.update(("yolo_model", "threshold_config"))
     if set(job) != expected or job["split"] != "validation":
         raise ValueError("unexpected worker fields or non-validation split")
     def timeout_handler(signum, frame):
@@ -101,17 +108,16 @@ def main():
             write_json(path, info)
 
     ev.post = post
-    for stage_name in STAGES:
-        original = getattr(ev, stage_name)
-        def wrapped(*a, _original=original, _stage=stage_name, **kw):
+    def instrument_stage(stage, function):
+        def wrapped(*args, **kwargs):
             nonlocal current_stage
-            current_stage = _stage
-            path = audit / f"stage-{_stage}.json"
-            info = {"stage": _stage, "started_at": now(), "status": "running"}
+            current_stage = stage
+            path = audit / f"stage-{stage}.json"
+            info = {"stage": stage, "started_at": now(), "status": "running"}
             write_json(path, info)
             started = time.monotonic()
             try:
-                result = _original(*a, **kw)
+                result = function(*args, **kwargs)
                 info["status"] = "completed"
                 return result
             except Exception as exc:
@@ -120,14 +126,24 @@ def main():
             finally:
                 info.update(elapsed_seconds=time.monotonic() - started, finished_at=now())
                 write_json(path, info)
-        setattr(ev, stage_name, wrapped)
-    from types import SimpleNamespace
-    namespace = SimpleNamespace(video=Path(job["video"]), task=job["task"], episode=job["episode"],
-                                split="validation", out=Path(job["out"]),
-                                yolo_model=Path(job["yolo_model"]),
-                                threshold_config=Path(job["threshold_config"]) if job["threshold_config"] else None)
+        return wrapped
+
     try:
-        ev.run(namespace, sample_interval_seconds=job["sample_interval_seconds"])
+        folder = Path(job["out"])
+        if direct:
+            folder.mkdir()
+            body, manifest = instrument_stage("sample_frames", prepare_request)(ev, job, folder)
+            result = instrument_stage("evaluate_direct", score_request)(
+                ev, folder, body, manifest, os.environ["TYPESAFE_API_KEY"])
+            write_json(folder / "result.json", result)
+        else:
+            from types import SimpleNamespace
+            for stage in STAGES:
+                setattr(ev, stage, instrument_stage(stage, getattr(ev, stage)))
+            namespace = SimpleNamespace(video=Path(job["video"]), task=job["task"], episode=job["episode"],
+                                        split="validation", out=folder, yolo_model=Path(job["yolo_model"]),
+                                        threshold_config=Path(job["threshold_config"]) if job["threshold_config"] else None)
+            ev.run(namespace, sample_interval_seconds=job["sample_interval_seconds"])
     except Exception as exc:
         write_json(args.job.parent / "worker-failure.json",
                    {"stage": current_stage, "error_type": type(exc).__name__, "error": str(exc)})

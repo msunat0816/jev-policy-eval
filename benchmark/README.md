@@ -1,6 +1,6 @@
 # JEV validation 开发评测工具
 
-只覆盖三个阶段：离线预检、validation 5–10 条真实链路试点、约 50 条 validation 开发评估。暂不实现 baseline、消融、长程专项人工审核或 test 集正式评估。
+框架评测覆盖离线预检、validation 5–10 条真实链路试点和约 50 条 validation 开发评估。直接 JEV 图像评分 baseline 使用同一 validation 开发清单和报告口径，运行方式见下方。
 
 评测工具通过 `--framework-root` 指向待测框架。在本仓库运行时，将它设为仓库根目录；也可以指向另一份独立的交付目录。
 
@@ -126,6 +126,38 @@ run 在正常返回或 Ctrl-C 后生成对应阶段报告。也可以纯离线�
 - 未提供费率时费用显示不可用。可用 `report --rates /path/to/rates.json` 输入经核实的费率，键为 `qwen/typesafe`，值可包含 `input_usd_per_million/output_usd_per_million/per_request_usd`。这只是估算；缺失 usage 不计为零费用，报告未计价调用数。
 
 同一框架同时使用 Qwen 和 JEV；本阶段没有对照实验，因此这些结果只能说明链路与开发集表现，不能证明比直接评分更好，或证明长程机制有效。
+
+## 直接 JEV 图像评分 baseline
+
+复用 first delivery 的 `validation-50/plan.json`。如果需要恢复清单，使用上面的固定快照、种子和默认参数，核对 `input_sha256` 为 `8022bcaca064411137f99397af65c2e3eef50a9a5a663f046d0ea44cffb52067`。开发评估保留原 50 条；baseline 试点按实测时长均匀选取 10 个排序位置，包含最短和最长视频，所以先下载全部 50 条视频。
+
+每段视频按原始 PTS 分为相对首帧的 2 秒时间桶，选每个非空桶的首帧并保留末帧。短于 2 秒的视频保留首末帧，单帧视频只发送一次。一个请求包含原始任务、排序后的图像与原始帧号/PTS，以及 first delivery 的同一 rubric。固定使用 `jev-1.14.0`，一次 Choice 返回 `level_1` 到 `level_5` 或 `insufficient_evidence`。真实标签只在报告时合并。
+
+图像适配与 first delivery 的图文 JEV 一致。每次请求使用图像和长上下文请求头，限制 128 张图和 32 MiB JSON 请求体，单图限制 16 MiB。图片数是本地资源保护上限；TypeSafe 判定实际 token 数与处理后的请求尺寸。超限按错误记录，固定采样帧完整保留，模型请求最多尝试一次。[TypeSafe 图像限制](https://docs.typesafe.ai/images#limits) · [TypeSafe 长上下文](https://docs.typesafe.ai/models#long-context)
+
+运行需要 Python 3.11+、`ffprobe`、NumPy 和 OpenCV。真实请求使用 `TYPESAFE_API_KEY`。使用同一运行目录先验收试点，再继续开发评估：
+
+```sh
+DATA=benchmark-data/validation-50
+DIRECT=benchmark-runs/direct-jev-01
+"$PY" -B -m benchmark download --dataset "$DATA" --phase development
+"$PY" -B -m benchmark inspect-direct --dataset "$DATA" \
+  --out benchmark-output/direct-jev-pilot-inspection
+"$PY" -B -m benchmark run --method direct-jev --framework-root "$PWD" \
+  --dataset "$DATA" --out "$DIRECT" --phase pilot --execute
+"$PY" -B -m benchmark run --method direct-jev --framework-root "$PWD" \
+  --dataset "$DATA" --out "$DIRECT" --phase development --execute
+```
+
+`inspect-direct` 在本地生成试点 JPEG、帧号和请求清单，供调用前核对。真实运行的 `reports/<phase>/` 使用框架报告的 MAE、覆盖率、分组、混淆矩阵和资源指标；`predictions.csv` 增加采样帧号、图片数、请求字节、token 和请求时间。逐条记录含实际 PTS、图片 SHA256、服务端用量、错误及阶段耗时。开发阶段复用已尝试的试点样本。
+
+两个开发运行目录齐备后，生成同一批视频的比较报告。报告保留各自的完整 50 条分母，也计算双方均有数值评分样本上的配对 MAE 差：
+
+```sh
+"$PY" -B -m benchmark compare --dataset "$DATA" --direct-run "$DIRECT" \
+  --framework-run benchmark-runs/delivery-01 \
+  --out benchmark-output/direct-vs-framework.json
+```
 
 ## 已完成的本地验收
 

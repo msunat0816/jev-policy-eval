@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from benchmark import data, metrics, runner
 from benchmark.common import digest, object_hash, read_json, write_json, write_jsonl
-from benchmark.report import create_report
+from benchmark.report import compare_runs, create_report
 
 
 FAKE_FRAMEWORK = '''import json, time
@@ -204,6 +204,27 @@ class RunnerTests(unittest.TestCase):
     def sample(self, row=None, name="one", **config):
         return runner.execute_sample(row or self.inputs[0], self.dataset, self.root / name,
                                      {**self.configuration, **config})
+
+    def test_comparison_uses_full_denominator_and_common_scored_pairs(self):
+        rubric = "prompts/roboreward_rubric.json"
+        common = {"plan_sha256": digest(self.dataset / "plan.json"),
+                  "framework": {"files": {rubric: "fixture-rubric"}}}
+        direct_run, framework_run = self.root / "direct", self.root / "original"
+        sample_id = self.inputs[0]["sample_id"]
+        for run, configuration, score in ((direct_run, {**common, "method": "direct-jev"}, 5),
+                                          (framework_run, common, 4)):
+            write_json(run / "configuration.json", configuration)
+            write_json(run / "runtime.json", {"models": {"jev": "jev-fixture"}})
+            write_json(run / "episodes" / sample_id / "record.json",
+                       {"configuration_sha256": object_hash(configuration), "status": "scored", "score": score})
+        report = self.root / "comparison.json"
+        compare_runs(self.dataset, direct_run, framework_run, report)
+        result = read_json(report)
+        self.assertEqual(result["direct_jev"]["overall"]["n"], 12)
+        self.assertEqual(result["framework"]["overall"]["n"], 12)
+        self.assertEqual(result["both_scored"]["sample_ids"], [sample_id])
+        reward = data.load_dataset(self.dataset)[2][sample_id]["reward"]
+        self.assertEqual(result["both_scored"]["direct_minus_framework_mae"], abs(5 - reward) - abs(4 - reward))
 
     def test_real_subprocess_instruments_calls_and_keeps_secrets_out(self):
         record = self.sample()

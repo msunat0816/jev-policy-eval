@@ -5,9 +5,10 @@ from pathlib import Path
 import sys
 
 from .common import digest, now, read_json, write_json
-from .data import REVISION, download, hub_url, prepare, transfer
-from .preflight import preflight
-from .report import create_report, joined_rows
+from .data import REVISION, download, hub_url, load_dataset, prepare, transfer
+from .direct_jev import METHOD, inspect_requests, select_pilot
+from .preflight import preflight, verify_videos
+from .report import compare_runs, create_report, joined_rows
 from .runner import run, run_lock
 
 
@@ -33,6 +34,7 @@ def main():
     check.add_argument("--framework-root", type=Path, required=True)
     check.add_argument("--python", default=sys.executable)
     check.add_argument("--yolo-model", type=Path)
+    check.add_argument("--method", choices=("framework", METHOD), default="framework")
     check.add_argument("--dataset", type=Path)
     check.add_argument("--phase", choices=("pilot", "development"), default="pilot")
     check.add_argument("--run-tests", action="store_true")
@@ -40,7 +42,8 @@ def main():
     runner = commands.add_parser("run", help="dry-run by default; --execute enables paid APIs")
     runner.add_argument("--dataset", type=Path, required=True)
     runner.add_argument("--framework-root", type=Path, required=True)
-    runner.add_argument("--yolo-model", type=Path, required=True)
+    runner.add_argument("--yolo-model", type=Path, help="required for the framework method")
+    runner.add_argument("--method", choices=("framework", METHOD), default="framework")
     runner.add_argument("--out", type=Path, required=True)
     runner.add_argument("--python", default=sys.executable)
     runner.add_argument("--phase", choices=("pilot", "development"), default="pilot")
@@ -51,6 +54,9 @@ def main():
     runner.add_argument("--max-calls-per-episode", type=int)
     runner.add_argument("--max-new-episodes", type=int)
     runner.add_argument("--batch-seconds", type=float, help="stop between episodes after this wall time; not a billing cap")
+    inspect = commands.add_parser("inspect-direct", help="build requests for the duration pilot locally; no model calls")
+    inspect.add_argument("--dataset", type=Path, required=True)
+    inspect.add_argument("--out", type=Path, required=True)
     report = commands.add_parser("report", help="join labels after predictions and build offline reports")
     report.add_argument("--dataset", type=Path, required=True)
     report.add_argument("--run", type=Path, required=True)
@@ -58,6 +64,11 @@ def main():
     report.add_argument("--phase", choices=("pilot", "development"), default="development")
     report.add_argument("--bootstrap-iterations", type=int, default=2000)
     report.add_argument("--rates", type=Path, help="optional user-supplied provider USD rate JSON")
+    compare = commands.add_parser("compare", help="compare direct and framework development runs on the same validation IDs")
+    compare.add_argument("--dataset", type=Path, required=True)
+    compare.add_argument("--direct-run", type=Path, required=True)
+    compare.add_argument("--framework-run", type=Path, required=True)
+    compare.add_argument("--out", type=Path, required=True, help="comparison JSON file")
     freeze = commands.add_parser("freeze", help="seal the completed development configuration and report")
     freeze.add_argument("--dataset", type=Path, required=True)
     freeze.add_argument("--run", type=Path, required=True)
@@ -78,7 +89,8 @@ def main():
                 return 2
         elif args.command == "preflight":
             result = preflight(args.framework_root, python=args.python, model=args.yolo_model,
-                               dataset=args.dataset, stage=args.phase, run_tests=args.run_tests, out=args.out)
+                               dataset=args.dataset, stage=args.phase, run_tests=args.run_tests,
+                               out=args.out, method=args.method)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             # Offline tests can pass while live inputs/keys remain unavailable.
             return 0 if result["ready_for_live"] else 2
@@ -88,7 +100,8 @@ def main():
                              phase=args.phase, python=args.python, execute=args.execute,
                              timeout=args.timeout_seconds, interval=args.sample_interval_seconds,
                              threshold_config=args.threshold_config, max_calls=args.max_calls_per_episode,
-                             max_new_episodes=args.max_new_episodes, batch_seconds=args.batch_seconds)
+                             max_new_episodes=args.max_new_episodes, batch_seconds=args.batch_seconds,
+                             method=args.method)
             except KeyboardInterrupt:
                 if (args.out / "configuration.json").exists():
                     create_report(args.dataset, args.out, phase=args.phase)
@@ -96,12 +109,27 @@ def main():
                 return 130
             if args.execute:
                 result["report"] = create_report(args.dataset, args.out, phase=args.phase)
+        elif args.command == "inspect-direct":
+            import evaluate_rollout as ev
+            plan, inputs, _ = load_dataset(args.dataset)
+            videos = verify_videos(args.dataset, inputs)
+            if not videos["ok"]:
+                raise ValueError(f"video verification failed: {videos['errors']}")
+            ids = select_pilot(inputs, videos["details"], plan["pilot_size"])
+            by_id = {row["sample_id"]: row for row in inputs}
+            result = inspect_requests(ev, [by_id[sample_id] for sample_id in ids], args.dataset,
+                                      args.out, videos["details"])
+            if any(row["status"] != "prepared" for row in result["samples"]):
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 2
         elif args.command == "report":
             if args.bootstrap_iterations < 0:
                 raise ValueError("bootstrap iterations must be nonnegative")
             result = create_report(args.dataset, args.run, args.out, phase=args.phase,
                                    iterations=args.bootstrap_iterations,
                                    rates=read_json(args.rates) if args.rates else None)
+        elif args.command == "compare":
+            result = compare_runs(args.dataset, args.direct_run, args.framework_run, args.out)
         elif args.command == "freeze":
             with run_lock(args.run):
                 if (args.run / "freeze.json").exists():

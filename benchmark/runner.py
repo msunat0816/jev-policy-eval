@@ -14,7 +14,8 @@ from urllib.parse import urlsplit
 from .common import (digest, framework_fingerprint, inside, now, object_hash,
                      positive, read_json, write_json)
 from .data import load_dataset
-from .preflight import WORKER, preflight
+from .direct_jev import MAX_FRAMES, METHOD, PROMPT_PATH, SAMPLE_INTERVAL_SECONDS, select_pilot
+from .preflight import WORKER, preflight, verify_videos
 
 
 @contextmanager
@@ -90,8 +91,12 @@ def collect_artifacts(directory):
     stages = [read_json(path) for path in sorted(audit.glob("stage-*.json"))]
     disk = sum(p.stat().st_size for p in directory.rglob("*") if p.is_file())
     failed = [r for r in stages if r["status"] in ("failed", "running")]
-    return {"calls": calls, "stages": stages, "disk_bytes": disk,
-            "failed_stage": failed[-1]["stage"] if failed else "initialization"}
+    result = {"calls": calls, "stages": stages, "disk_bytes": disk,
+              "failed_stage": failed[-1]["stage"] if failed else "initialization"}
+    sampling_path = directory / "rollout" / "sampling.json"
+    if sampling_path.exists():
+        result["sampling"] = read_json(sampling_path)
+    return result
 
 
 def execute_sample(row, dataset, directory, configuration, video_info=None):
@@ -100,11 +105,13 @@ def execute_sample(row, dataset, directory, configuration, video_info=None):
     video = inside(dataset, row["video_path"])
     job = {"video": str(video), "task": row["task"], "episode": row["sample_id"],
            "split": "validation", "out": str(directory / "rollout"),
-           "yolo_model": configuration["yolo_model"]["path"],
-           "threshold_config": configuration["threshold_path"],
            "sample_interval_seconds": configuration["sample_interval_seconds"],
            "max_calls": configuration["max_calls_per_episode"],
            "timeout_seconds": configuration["timeout_seconds"]}
+    direct = configuration.get("method") == METHOD
+    if not direct:
+        job.update(yolo_model=configuration["yolo_model"]["path"],
+                   threshold_config=configuration["threshold_path"])
     write_json(directory / "job.json", job)
     record = {"sample_id": row["sample_id"], "configuration_sha256": object_hash(configuration),
               "status": "running", "score": None, "started_at": now(),
@@ -117,11 +124,16 @@ def execute_sample(row, dataset, directory, configuration, video_info=None):
     interrupted = False
     try:
         record["video_sha256"] = digest(video)
+        if video_info and video_info.get("sha256", record["video_sha256"]) != record["video_sha256"]:
+            raise ValueError("video SHA256 changed after preflight")
         write_json(record_path, record)
+        command = [configuration["python"], "-B", str(WORKER),
+                   "--framework-root", configuration["framework"]["root"],
+                   "--job", str(directory / "job.json")]
+        if direct:
+            command += ["--method", METHOD]
         with (directory / "worker.log").open("wb") as log:
-            process = subprocess.Popen([configuration["python"], "-B", str(WORKER),
-                                        "--framework-root", configuration["framework"]["root"],
-                                        "--job", str(directory / "job.json")],
+            process = subprocess.Popen(command,
                                        cwd=directory, stdout=log, stderr=subprocess.STDOUT,
                                        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
                                        start_new_session=True)
@@ -171,7 +183,7 @@ def execute_sample(row, dataset, directory, configuration, video_info=None):
 
 def run(dataset, out, root, model, *, phase="pilot", python=sys.executable,
         execute=False, timeout=1800, interval=2., threshold_config=None,
-        max_calls=None, max_new_episodes=None, batch_seconds=None):
+        max_calls=None, max_new_episodes=None, batch_seconds=None, method="framework"):
     positive(timeout, "timeout")
     positive(interval, "sample interval")
     for number, name in ((max_calls, "max calls"), (max_new_episodes, "max new episodes")):
@@ -179,15 +191,31 @@ def run(dataset, out, root, model, *, phase="pilot", python=sys.executable,
             raise ValueError(f"{name} must be a positive integer")
     if batch_seconds is not None:
         positive(batch_seconds, "batch seconds")
-    dataset, out, root, model = map(lambda p: Path(p).resolve(), (dataset, out, root, model))
+    direct = method == METHOD
+    if direct:
+        if model is not None or threshold_config is not None or interval != SAMPLE_INTERVAL_SECONDS or max_calls not in (None, 1):
+            raise ValueError("direct-jev requires 2-second sampling and one call, with no YOLO weights or expert thresholds")
+        max_calls = 1
+    dataset, out, root = (Path(path).resolve() for path in (dataset, out, root))
+    model = Path(model).resolve() if model is not None else None
     plan, inputs, _ = load_dataset(dataset)
-    ids = plan["pilot_ids"] if phase == "pilot" else plan["development_ids"]
+    pilot_ids = plan["pilot_ids"]
+    video_check = None
+    if direct:
+        video_check = verify_videos(dataset, inputs)
+        if not video_check["ok"]:
+            failed = video_check["errors"][0]
+            raise ValueError(f"duration pilot requires verified videos for all validation IDs. {failed['sample_id']}: {failed['error']}")
+        pilot_ids = select_pilot(inputs, video_check["details"], plan["pilot_size"])
+    ids = pilot_ids if phase == "pilot" else plan["development_ids"]
     rows = [r for r in inputs if r["sample_id"] in set(ids)]
+    if direct and phase == "pilot":
+        rows = sorted(rows, key=lambda row: pilot_ids.index(row["sample_id"]))
     if not execute:
         return {"dry_run": True, "phase": phase, "samples": len(rows), "sample_ids": ids,
                 "out": str(out), "model_calls": 0,
                 "note": "add --execute to run; no weights or videos are downloaded by run"}
-    if not model.is_file() or model.suffix.lower() != ".onnx":
+    if not direct and (model is None or not model.is_file() or model.suffix.lower() != ".onnx"):
         raise ValueError("provide a local segmentation ONNX model")
     fingerprint = framework_fingerprint(root)
     harness_hashes = {p.name: digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))}
@@ -197,7 +225,7 @@ def run(dataset, out, root, model, *, phase="pilot", python=sys.executable,
                      "harness_sha256": object_hash(harness_hashes),
                      # Preserve virtualenv symlinks; resolve() would bypass the venv.
                      "python": str(Path(shutil.which(str(python)) or python).absolute()),
-                     "yolo_model": {"path": str(model), "sha256": digest(model)},
+                     "yolo_model": {"path": str(model), "sha256": digest(model)} if model else None,
                      "timeout_seconds": timeout, "sample_interval_seconds": interval,
                      "max_calls_per_episode": max_calls,
                      "dashscope_endpoint_override": {
@@ -206,6 +234,11 @@ def run(dataset, out, root, model, *, phase="pilot", python=sys.executable,
                      "threshold_sha256": digest(threshold_config) if threshold_config else None,
                      "threshold_path": str(out / "frozen-threshold.json") if threshold_config else None,
                      "retries": 0}
+    if direct:
+        configuration.update(method=METHOD, pilot_ids=pilot_ids, direct_prompt_sha256=digest(PROMPT_PATH),
+                             max_sampled_frames=MAX_FRAMES,
+                             video_inventory_sha256=digest(dataset / "video-inventory.json"))
+        del configuration["dashscope_endpoint_override"]
     out.mkdir(parents=True, exist_ok=True)
     with run_lock(out):
         if (out / "freeze.json").exists():
@@ -221,8 +254,17 @@ def run(dataset, out, root, model, *, phase="pilot", python=sys.executable,
             # Compare parsed JSON too, because the frozen copy is formatted.
             if read_json(out / "frozen-threshold.json") != read_json(threshold_config):
                 raise ValueError("frozen threshold configuration changed")
+        if direct and phase == "development":
+            pilot_statuses = []
+            for sample_id in pilot_ids:
+                journal = out / "episodes" / sample_id / "record.json"
+                pilot_statuses.append(read_json(journal)["status"] if journal.is_file() else "not_run")
+            if (any(status in ("not_run", "running", "interrupted") for status in pilot_statuses)
+                    or not any(status in ("scored", "insufficient_evidence") for status in pilot_statuses)):
+                raise ValueError("run the complete direct-jev pilot with at least one valid API response before development")
+        check_args = {"method": method, "verified_videos": video_check} if direct else {}
         check = preflight(root, python=configuration["python"], model=model,
-                          dataset=dataset, stage=phase, out=out / f"preflight-{phase}")
+                          dataset=dataset, stage=phase, out=out / f"preflight-{phase}", **check_args)
         if not check["ready_for_live"]:
             raise ValueError(f"preflight failed; inspect {out / ('preflight-' + phase) / 'preflight.json'}")
         runtime_path = out / "runtime.json"
@@ -254,7 +296,7 @@ def run(dataset, out, root, model, *, phase="pilot", python=sys.executable,
                 continue
             if framework_fingerprint(root)["code_sha256"] != fingerprint["code_sha256"]:
                 raise ValueError("framework code changed during the run")
-            if digest(model) != configuration["yolo_model"]["sha256"]:
+            if model and digest(model) != configuration["yolo_model"]["sha256"]:
                 raise ValueError("ONNX weights changed during the run")
             info = check["checks"]["videos"]["details"][row["sample_id"]]
             record = execute_sample(row, dataset, directory, configuration, info)

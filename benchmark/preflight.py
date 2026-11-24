@@ -6,8 +6,9 @@ import shutil
 import subprocess
 import sys
 
-from .common import framework_fingerprint, inside, read_json, write_json
+from .common import digest, framework_fingerprint, inside, read_json, write_json
 from .data import load_dataset
+from .direct_jev import METHOD
 
 WORKER = Path(__file__).with_name("worker.py").resolve()
 
@@ -32,18 +33,39 @@ def probe_video(path, ffprobe="ffprobe"):
             "nb_frames": stream.get("nb_frames")}
 
 
+def verify_videos(dataset, inputs):
+    inventory_path = Path(dataset) / "video-inventory.json"
+    inventory = read_json(inventory_path) if inventory_path.exists() else {}
+    videos, errors = {}, []
+    for row in inputs:
+        try:
+            path = inside(dataset, row["video_path"])
+            expected = inventory.get(row["video_id"], {}).get("sha256")
+            if expected is None or digest(path) != expected:
+                raise ValueError("video missing or SHA256 differs from download inventory")
+            videos[row["sample_id"]] = {**probe_video(path), "sha256": expected}
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            errors.append({"sample_id": row["sample_id"], "error": str(exc)})
+    return {"ok": not errors, "details": videos, "errors": errors}
+
+
 def preflight(root, *, python=sys.executable, model=None, dataset=None, stage="pilot",
-              run_tests=False, out=None):
+              run_tests=False, out=None, method="framework", verified_videos=None):
+    direct = method == METHOD
     result = {"framework": framework_fingerprint(root), "checks": {}, "test_result": None,
               "scope": "validation development only; no model API calls"}
     checks = result["checks"]
     checks["ffprobe"] = {"ok": bool(shutil.which("ffprobe"))}
-    checks["credentials"] = {"ok": all(os.getenv(k) for k in ("DASHSCOPE_API_KEY", "TYPESAFE_API_KEY")),
-                              "present": {k: bool(os.getenv(k)) for k in ("DASHSCOPE_API_KEY", "TYPESAFE_API_KEY")}}
+    keys = ("TYPESAFE_API_KEY",) if direct else ("DASHSCOPE_API_KEY", "TYPESAFE_API_KEY")
+    checks["credentials"] = {"ok": all(os.getenv(k) for k in keys),
+                              "present": {k: bool(os.getenv(k)) for k in keys}}
     valid_model = model is not None and Path(model).is_file() and Path(model).suffix.lower() == ".onnx"
-    checks["model_file"] = {"ok": valid_model}
+    if not direct:
+        checks["model_file"] = {"ok": valid_model}
     command = [str(python), "-B", str(WORKER), "--framework-root", str(Path(root).resolve()), "--probe"]
-    if valid_model:
+    if direct:
+        command += ["--method", METHOD]
+    if valid_model and not direct:
         command += ["--yolo-model", str(Path(model).resolve())]
     try:
         process = subprocess.run(command, capture_output=True, text=True, timeout=120)
@@ -52,25 +74,13 @@ def preflight(root, *, python=sys.executable, model=None, dataset=None, stage="p
                               "details": json.loads(process.stdout) if process.returncode == 0 else process.stderr[-3000:]}
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         checks["runtime"] = {"ok": False, "error": str(exc)}
-    if dataset:
+    if verified_videos is not None:
+        checks["videos"] = verified_videos
+    elif dataset:
         try:
-            from .common import digest
             plan, inputs, _ = load_dataset(dataset)
-            inventory_path = Path(dataset) / "video-inventory.json"
-            inventory = read_json(inventory_path) if inventory_path.exists() else {}
-            ids = set(plan["pilot_ids"] if stage == "pilot" else plan["development_ids"])
-            videos, errors = {}, []
-            for row in inputs:
-                if row["sample_id"] not in ids:
-                    continue
-                try:
-                    path = inside(dataset, row["video_path"])
-                    if row["video_id"] not in inventory or digest(path) != inventory[row["video_id"]]["sha256"]:
-                        raise ValueError("video missing or SHA256 differs from download inventory")
-                    videos[row["sample_id"]] = probe_video(path)
-                except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                    errors.append({"sample_id": row["sample_id"], "error": str(exc)})
-            checks["videos"] = {"ok": not errors, "details": videos, "errors": errors}
+            ids = set(plan["pilot_ids"] if stage == "pilot" and not direct else plan["development_ids"])
+            checks["videos"] = verify_videos(dataset, (row for row in inputs if row["sample_id"] in ids))
         except (OSError, ValueError, KeyError) as exc:
             checks["videos"] = {"ok": False, "error": str(exc)}
     else:
