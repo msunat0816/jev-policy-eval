@@ -129,6 +129,22 @@ class ExpertExecutionTests(unittest.TestCase):
         self.assertTrue(all(r["status"] == "missing" for r in records))
         self.assertIsNone(records[0]["result"]["frames"][0]["pairs"][0]["measurement"])
 
+    def test_program_missing_provenance_requires_empty_inventory_and_null_model(self):
+        for mode in ("valid", "nonempty", "bound", "model", "omitted"):
+            with self.subTest(mode=mode):
+                inputs = self.inputs(empty=mode != "nonempty")
+                for binding in inputs[-1]["windows"][0]["bindings"]:
+                    binding.update(status="missing", candidate_id=None, reason="No candidates detected.")
+                    binding["source"].update(method="program_empty_candidate_inventory", model=None)
+                first = inputs[-1]["windows"][0]["bindings"][0]
+                if mode == "bound": first.update(status="bound", candidate_id="f0:d0")
+                elif mode == "model": first["source"]["model"] = ev.MATCHING_MODEL
+                elif mode == "omitted": inputs[-1]["windows"][0]["bindings"].pop()
+                if mode == "valid":
+                    self.assertTrue(all(r["status"] == "missing" for r in self.run_execution(inputs)["records"]))
+                else:
+                    with self.assertRaises(ValueError): self.run_execution(inputs)
+
     def test_single_frame_window_executes_only_spatial_geometry(self):
         obs = matching_observation()
         obs["frames"] = [obs["frames"][0]]

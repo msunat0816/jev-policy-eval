@@ -181,6 +181,14 @@ def validate_packaging_inputs(task, obs, selection, times, candidates, matching,
                                "request_file": window["request_file"], "candidate_file": CANDIDATE_FILE}}
         _require(all(record.get(k) == value for k, value in metadata.items()), "execution identity/binding/source differs from proposal")
         _require(record.get("status") in ("complete", "partial", "missing"), "invalid execution coverage status")
+        unresolved = [b for b in used if b["status"] == "unresolved"]
+        if unresolved:
+            missing = [{"entity_key": b["entity_key"], "frame_id": b["frame_id"], "pts_seconds": b["pts_seconds"],
+                        "candidate_id": None, "reason": "binding_unresolved", "binding_reason": b["reason"]} for b in unresolved]
+            _require(record.get("execution_status") == "not_executed" and record["status"] == "missing"
+                     and record.get("reason") == "binding_unresolved" and record.get("result") is None
+                     and record.get("missing") == missing, "unresolved binding must not have expert measurements")
+            continue
         if spatial:
             _validate_spatial(record, by_frame, times)
         else:
@@ -359,7 +367,9 @@ def _summarize_record(record, times):
     item["missing"] = copy.deepcopy(record.get("missing", []))
     if record["result"] is None:
         item["summary"] = None
-        item["limitations"] = ["No reliable target mask; tracking was not executed."]
+        item["limitations"] = (["Required entity bindings remain unresolved after completion; this expert was not executed. Images remain usable and this is not evidence of task failure."]
+                               if record["reason"] == "binding_unresolved" else
+                               ["No reliable target mask; tracking was not executed."])
         return item
     item["limitations"] = copy.deepcopy(record["result"]["limitations"])
     if record["expert_id"] == "object_spatial":
@@ -387,7 +397,7 @@ def _threshold_comparison(contract, records, times):
         return out
     out["raw_result_ref"] = {"file": EXECUTION_FILE, "record_id": record["id"]}
     if record["result"] is None:
-        out["reason"] = "target_mask_unavailable"
+        out["reason"] = record["reason"]
         return out
     values = {}
     if record["expert_id"] == "object_spatial":

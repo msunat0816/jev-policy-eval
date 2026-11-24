@@ -28,7 +28,9 @@ Window relevance, proposal reasons and entity bindings are fallible model record
 not independent proof. Candidate IDs are frame-local; detection category does
 not prove identity. Preserve identity uncertainty and conflicts. Missing expert
 measurements do not invalidate an image-based check judgment, while available
-measurements alone do not establish task satisfaction. No invented threshold
+measurements alone do not establish task satisfaction. Unresolved bindings and
+skipped experts record a processing limitation, not a failed task requirement.
+Keep their uncertainty separate from visual absence. No invented threshold
 defines grasped, released or stable. Two-dimensional geometry and local motion
 alone do not establish three-dimensional contact, support, grasp or stability.
 Separate tracks retain independent seed origins. Use the recorded arithmetic;

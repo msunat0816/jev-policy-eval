@@ -83,8 +83,9 @@ def _unresolved(packet, judgment):
         if window["relevance"] == "uncertain" or window["limitations"]:
             items.append({"kind": "window_limitation", **copy.deepcopy(window)})
     for binding in packet["bindings"]:
-        if binding["status"] == "missing":
-            items.append({"kind": "missing_binding", **copy.deepcopy(binding)})
+        if binding["status"] in ("missing", "unresolved"):
+            items.append({"kind": "unresolved_binding" if binding["status"] == "unresolved" else "missing_binding",
+                          **copy.deepcopy(binding)})
     for measurement in packet["measurements"]:
         if measurement["status"] != "complete" or measurement["missing"]:
             items.append({"kind": "measurement_gap", **{key: copy.deepcopy(measurement[key]) for key in

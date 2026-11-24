@@ -26,6 +26,9 @@ entity. Use the explicit entity bindings and inspect their visual consistency.
 Missing or conflicting bindings must not be silently resolved by category, list
 position, or repeated candidate numbers across frames. A missing detection alone
 does not establish that an object is absent.
+An unresolved binding records an omitted model answer that one completion attempt
+could not resolve. It is not a visual finding of absence. The affected expert was
+not executed; judge from the retained images where sufficient, otherwise unknown.
 
 Images can be sufficient even when an expert is missing. Conversely, available
 measurements and satisfied numeric thresholds do not by themselves decide a check.

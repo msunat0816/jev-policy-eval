@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import cv2
@@ -33,8 +33,11 @@ from measurement_adapter import (ADAPTER_VERSION, LAYOUT_MARGIN_PX, adapt_requir
                                  requirement_verdict)
 from window_selection import (SELECTION_PROTOCOL, WINDOW_THRESHOLD, build_selection_request,
                               summarize_selection)
-from vlm_matching import (CANDIDATE_FRAME_POLICY, CANDIDATE_PROTOCOL, EMPTY_CANDIDATE_BINDING_METHOD, EXPERT_CATALOG, MATCHING_MODEL,
-                          MATCHING_PROMPT, MATCHING_PROTOCOL, matching_context, parse_window_matching,
+from vlm_matching import (BINDING_COMPLETION_PROTOCOL, BINDING_PROMPT, COMPLETION_BINDING_METHOD,
+                          UNRESOLVED_BINDING_METHOD, CANDIDATE_FRAME_POLICY, CANDIDATE_PROTOCOL,
+                          EMPTY_CANDIDATE_BINDING_METHOD, EXPERT_CATALOG, MATCHING_MODEL,
+                          MATCHING_PROMPT, MATCHING_PROTOCOL, matching_context, merge_binding_completion,
+                          parse_window_matching, required_binding_pairs,
                           validate_candidate_inputs, validate_matching_inputs)
 
 
@@ -300,6 +303,63 @@ def generate_candidates(task, obs, selection, times, cap, folder, model_path):
     return result
 
 
+def complete_window_bindings(task, obs, window, candidate_frames, frame_ids, initial, gaps, folder, image_directory):
+    """One visual completion of omitted slots; retain images if slots stay unresolved."""
+    name = f"03-bind-{window['id']}"
+    required = required_binding_pairs(initial["checks"])
+    requested_frames = sorted({frame for _, frame in gaps})
+    context = matching_context(task, obs, window,
+                               [frame for frame in candidate_frames if frame["frame_id"] in requested_frames])
+    context.update(validated_checks=initial["checks"], existing_bindings=initial["bindings"],
+                   required_pairs=[list(pair) for pair in required], requested_pairs=[list(pair) for pair in gaps])
+    content = [{"type": "text", "text": BINDING_PROMPT + "\nContext: " + json.dumps(context, ensure_ascii=False)}]
+    for frame in requested_frames:
+        for kind, suffix in (("original", ""), ("candidates", "-candidates")):
+            data = (folder / image_directory / f"{frame}{suffix}.jpg").read_bytes()
+            content.extend([{"type": "text", "text": f"frame {frame}; {kind}"},
+                            {"type": "image_url", "image_url": {
+                                "url": "data:image/jpeg;base64," + base64.b64encode(data).decode()}}])
+    error = None
+    remaining = list(gaps)
+    result = initial
+    base = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+    try:
+        response = post(base.rstrip("/") + "/chat/completions", os.environ["DASHSCOPE_API_KEY"],
+                        {"model": MATCHING_MODEL, "enable_thinking": False,
+                         "response_format": {"type": "json_object"},
+                         "messages": [{"role": "user", "content": content}]}, folder, name,
+                        image_directory=image_directory)
+    except (HTTPError, URLError, TimeoutError, ConnectionError) as exc:
+        # The benchmark's signal deadline is not a recoverable socket timeout.
+        if isinstance(exc, TimeoutError) and str(exc) == "worker wall-time limit reached":
+            raise
+        error = {"kind": "transport_error", "error_type": type(exc).__name__, "error": str(exc) or type(exc).__name__}
+    else:
+        try:
+            result, remaining = merge_binding_completion(response["choices"][0]["message"]["content"],
+                                                         initial, gaps, window, obs["candidate_checks"],
+                                                         frame_ids, candidate_frames)
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            error = {"kind": "invalid_response", "error_type": type(exc).__name__, "error": str(exc) or type(exc).__name__}
+    # Unanswered slots are program uncertainty, not visual absence or failed checks.
+    result = json.loads(json.dumps(result))
+    for entity, frame in remaining:
+        result["bindings"].append({"entity_key": entity, "frame_id": frame, "status": "unresolved",
+                                   "candidate_id": None,
+                                   "reason": "Required binding was omitted and one completion attempt did not resolve it; object presence and task outcome are unknown."})
+    result = parse_window_matching(json.dumps(result), window, obs["candidate_checks"], frame_ids,
+                                   candidate_frames, allow_unresolved=True)
+    completion = {"protocol": BINDING_COMPLETION_PROTOCOL, "required_pairs": [list(pair) for pair in required],
+                  "requested_pairs": [list(pair) for pair in gaps], "unresolved_pairs": [list(pair) for pair in remaining],
+                  "request_file": name + ".json", "error": error,
+                  "status": "completed" if not remaining else "unresolved" if len(remaining) == len(gaps) else "partial"}
+    save(folder / f"03-matching-{window['id']}-binding-completion.json",
+         {**completion, "initial_request_file": f"03-match-{window['id']}.json", "normalized_response": result})
+    logging.getLogger(__name__).warning("matching %s: completed %d omitted bindings; %d unresolved after one attempt",
+                                        window["id"], len(gaps) - len(remaining), len(remaining))
+    return result, completion
+
+
 def match_windows(task, obs, selection, times, cap, folder, candidates):
     """Associate checks/experts and bind supplied candidates, without executing experts."""
     selected = validate_matching_inputs(task, obs, selection, times)
@@ -341,10 +401,10 @@ def match_windows(task, obs, selection, times, cap, folder, candidates):
                          "response_format": {"type": "json_object"},
                          "messages": [{"role": "user", "content": content}]}, folder, name,
                         image_directory=image_directory)
-        cleanup_audit = []
+        cleanup_audit, gaps = [], []
         result = parse_window_matching(response["choices"][0]["message"]["content"], window,
                                        obs["candidate_checks"], frame_ids, candidate_frames,
-                                       cleanup_audit=cleanup_audit)
+                                       cleanup_audit=cleanup_audit, binding_gaps=gaps)
         cleanup_file = None
         if cleanup_audit:
             cleanup_file = f"03-matching-{window['id']}-binding-cleanup.json"
@@ -356,20 +416,33 @@ def match_windows(task, obs, selection, times, cap, folder, candidates):
                 "matching %s: removed %d unused bindings, added %d missing bindings for empty frames; audit: %s",
                 window["id"], sum(len(event.get("removed_bindings", [])) for event in cleanup_audit),
                 sum(len(event.get("added_bindings", [])) for event in cleanup_audit), cleanup_file)
+        completion = None
+        if gaps:
+            result, completion = complete_window_bindings(task, obs, window, candidate_frames, frame_ids,
+                                                          result, gaps, folder, image_directory)
         source = {"method": "matching_vlm_candidate_selection", "model": MATCHING_MODEL,
                   "request_file": name + ".json", "candidate_file": "03-yolo-candidates.json"}
         added_keys = {(b["entity_key"], b["frame_id"]) for event in cleanup_audit
                       for b in event.get("added_bindings", [])}
         program_source = {**source, "method": EMPTY_CANDIDATE_BINDING_METHOD, "model": None}
-        bindings = [{**binding, "pts_seconds": times[binding["frame_id"]],
-                     "source": dict(program_source if (binding["entity_key"], binding["frame_id"]) in added_keys else source)}
-                    for binding in result["bindings"]]
+        bindings = []
+        for binding in result["bindings"]:
+            key = (binding["entity_key"], binding["frame_id"])
+            binding_source = program_source if key in added_keys else source
+            if key in gaps:
+                unresolved = binding["status"] == "unresolved"
+                binding_source = {**source, "method": UNRESOLVED_BINDING_METHOD if unresolved else COMPLETION_BINDING_METHOD,
+                                  "model": None if unresolved else MATCHING_MODEL,
+                                  "request_file": completion["request_file"]}
+            bindings.append({**binding, "pts_seconds": times[binding["frame_id"]], "source": dict(binding_source)})
         record = {"window_id": window["id"], "frame_range": [first, last],
                   "frame_ids": frame_ids, "pts_seconds": [times[i] for i in frame_ids],
                   "image_directory": image_directory, "images": images, "request_file": name + ".json",
                   "candidate_file": "03-yolo-candidates.json", "checks": result["checks"], "bindings": bindings}
         if cleanup_file:
             record["binding_cleanup_file"] = cleanup_file
+        if completion is not None:
+            record["binding_completion"] = completion
         save(folder / f"03-matching-{window['id']}.json", record)
         matched.append(record)
     matching = {"protocol": MATCHING_PROTOCOL, "model": MATCHING_MODEL,
@@ -608,7 +681,9 @@ def run(args, *, sample_interval_seconds=DEFAULT_SAMPLE_INTERVAL_SECONDS):
              "vlm_matching": {"protocol": MATCHING_PROTOCOL, "model": MATCHING_MODEL,
                               "enabled": True, "frames": "all_original_frames_inclusive",
                               "candidate_views": "original_and_annotated_per_frame",
-                              "calls": "one_per_selected_window", "downstream_execution": True},
+                              "calls": "one_per_selected_window_plus_one_for_omitted_bindings",
+                              "binding_completion": BINDING_COMPLETION_PROTOCOL,
+                              "unresolved_bindings": "skip_affected_expert_preserve_images", "downstream_execution": True},
              "expert_execution": {"protocol": EXECUTION_PROTOCOL, "enabled": True,
                                   "segmentation": "reuse_saved_candidates",
                                   "motion_frames": "all_continuous_proposed_original_frames",

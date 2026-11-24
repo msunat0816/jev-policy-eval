@@ -10,11 +10,15 @@ from window_selection import build_selection_request, summarize_selection
 
 CANDIDATE_PROTOCOL = "yolo-window-candidates-v1"
 CANDIDATE_FRAME_POLICY = "all_selected_window_frames_inclusive_deduplicated"
-MATCHING_PROTOCOL = "vlm-window-check-expert-bindings-v2"
+MATCHING_PROTOCOL = "vlm-window-check-expert-bindings-v3"
 EMPTY_CANDIDATE_BINDING_METHOD = "program_empty_candidate_inventory"
+UNRESOLVED_BINDING_METHOD = "program_unresolved_binding"
+COMPLETION_BINDING_METHOD = "matching_vlm_binding_completion"
+BINDING_COMPLETION_PROTOCOL = "required-binding-completion-v1"
 MATCHING_MODEL = "qwen3.8-flash"
 MATCHING_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "qwen_window_matching.txt"
 MATCHING_PROMPT = MATCHING_PROMPT_PATH.read_text(encoding="utf-8")
+BINDING_PROMPT = (MATCHING_PROMPT_PATH.parent / "qwen_binding_completion.txt").read_text(encoding="utf-8")
 
 # Candidate masks already exist; geometry and motion are proposals for the next stage.
 EXPERT_CATALOG = {
@@ -178,12 +182,31 @@ def validate_candidate_inputs(candidates, selected, times):
     return {frame["frame_id"]: frame for frame in frames}
 
 
-def parse_window_matching(response_text, window, checklist, frame_ids, candidate_frames, *, cleanup_audit=None):
+def required_binding_pairs(checks):
+    """Derive the union from validated proposals, never from model-supplied slots."""
+    needed = set()
+    for check in checks:
+        for expert in check["experts"]:
+            if expert["expert_id"] == "object_spatial":
+                needed.update((entity, frame) for entity in expert["entity_keys"] for frame in expert["frame_ids"])
+            else:
+                entities = [expert["target_entity_key"]]
+                if expert["motion_mode"] == "relative":
+                    entities.append(expert["reference_entity_key"])
+                needed.update((entity, expert["frame_ids"][0]) for entity in entities)
+    return sorted(needed)
+
+
+def parse_window_matching(response_text, window, checklist, frame_ids, candidate_frames, *, cleanup_audit=None,
+                          binding_gaps=None, allow_unresolved=False):
     """Validate matching; an audit collector permits conservative normalization.
 
     The default remains strict for saved downstream inputs. All supplied bindings
     must be valid and unique. Omitted required bindings can only be supplied as
     missing when the validated candidate inventory explicitly has no detections.
+    binding_gaps defers only omitted required pairs for one completion attempt.
+    allow_unresolved is reserved for program-created saved records; provenance
+    is additionally checked by the execution boundary.
     """
     value = json.loads(response_text)
     _fields(value, ("window_id", "checks", "bindings"), "window matching")
@@ -215,9 +238,12 @@ def parse_window_matching(response_text, window, checklist, frame_ids, candidate
         elif binding["status"] == "missing":
             if cid is not None:
                 raise ValueError("matching: missing binding must have null candidate_id")
+        elif allow_unresolved and binding["status"] == "unresolved":
+            if cid is not None:
+                raise ValueError("matching: unresolved binding must have null candidate_id")
         else:
             raise ValueError("matching: binding status must be bound or missing")
-    seen, needed = set(), set()
+    seen = set()
     for item in value["checks"]:
         _fields(item, ("check_id", "relevance", "reason", "experts", "limitations"), "check matching")
         _text(item["check_id"], "check_id")
@@ -274,11 +300,9 @@ def parse_window_matching(response_text, window, checklist, frame_ids, candidate
             if expert_id == "short_window_motion":
                 if len(frames) < 2 or frames != list(range(frames[0], frames[-1] + 1)):
                     raise ValueError("matching: motion requires at least two continuous frames")
-                needed.update((entity, frames[0]) for entity in expert_entities)
-            else:
-                needed.update((entity, frame) for entity in expert_entities for frame in frames)
     if seen != set(checks):
         raise ValueError("matching: every checklist check needs exactly one relevance entry")
+    needed = set(required_binding_pairs(value["checks"]))
     original_count = len(bindings)
     added = []
     if cleanup_audit is not None:
@@ -292,20 +316,23 @@ def parse_window_matching(response_text, window, checklist, frame_ids, candidate
                            "reason": "No candidates were detected in this frame; missing binding added from the candidate inventory."}
                 bindings[(entity, frame)] = binding
                 added.append(binding)
-    if needed - set(bindings) or (cleanup_audit is None and set(bindings) != needed):
+    omitted = needed - set(bindings)
+    if (omitted and binding_gaps is None) or (cleanup_audit is None and set(bindings) - needed):
         raise ValueError("matching: exactly one bound/missing binding is required per proposed entity/frame")
     for item in value["checks"]:
         for expert in item["experts"]:
             if expert["expert_id"] == "short_window_motion" and expert["motion_mode"] == "relative":
                 first = expert["frame_ids"][0]
-                a, b = (bindings[(expert[role], first)] for role in ("target_entity_key", "reference_entity_key"))
-                if a["status"] == b["status"] == "bound" and a["candidate_id"] == b["candidate_id"]:
+                a, b = (bindings.get((expert[role], first)) for role in ("target_entity_key", "reference_entity_key"))
+                if a and b and a["status"] == b["status"] == "bound" and a["candidate_id"] == b["candidate_id"]:
                     raise ValueError("matching: motion target and reference cannot bind the same candidate")
     removed = [binding for key, binding in bindings.items() if key not in needed]
     if removed or added:
         value["bindings"] = [binding for key, binding in bindings.items() if key in needed]
         # Recheck the normalized response using the same strict downstream contract.
-        parse_window_matching(json.dumps(value), window, checklist, frame_ids, candidate_frames)
+        parse_window_matching(json.dumps(value), window, checklist, frame_ids, candidate_frames,
+                              binding_gaps=[] if binding_gaps is not None else None,
+                              allow_unresolved=allow_unresolved)
     if removed:
         cleanup_audit.append({"warning": "unused_bindings_removed", "window_id": value["window_id"],
                               "reason": "Bindings are not required by any expert proposal in this window.",
@@ -319,4 +346,30 @@ def parse_window_matching(response_text, window, checklist, frame_ids, candidate
                               "added_bindings": added,
                               "evidence": [{"frame_id": frame, "status": "no_detections", "candidate_count": 0}
                                            for frame in sorted({b["frame_id"] for b in added})]})
+    if binding_gaps is not None:
+        binding_gaps.extend(sorted(omitted))
     return value
+
+
+def merge_binding_completion(response_text, initial, requested_pairs, window, checklist, frame_ids, candidate_frames):
+    """Accept only requested slots, preserving every validated initial decision.
+
+    Partial replies are usable. Invalid replies are rejected atomically so a
+    malformed completion cannot silently change identities or expert proposals.
+    """
+    reply = json.loads(response_text)
+    _fields(reply, ("window_id", "bindings"), "binding completion")
+    if reply["window_id"] != window["id"] or not isinstance(reply["bindings"], list):
+        raise ValueError("binding completion: wrong window or bindings type")
+    requested = set(requested_pairs)
+    for binding in reply["bindings"]:
+        if (not isinstance(binding, dict) or type(binding.get("frame_id")) is not int
+                or not isinstance(binding.get("entity_key"), str)
+                or (binding["entity_key"], binding["frame_id"]) not in requested):
+            raise ValueError("binding completion: may only fill requested entity/frame pairs")
+    merged = copy.deepcopy(initial)
+    merged["bindings"].extend(reply["bindings"])
+    gaps = []
+    parsed = parse_window_matching(json.dumps(merged), window, checklist, frame_ids, candidate_frames,
+                                   binding_gaps=gaps)
+    return parsed, gaps

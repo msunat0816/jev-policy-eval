@@ -85,9 +85,124 @@ def window_matching(window_id="w0", first=0, last=2, *, motion=True):
 
 
 class VlmMatchingTests(unittest.TestCase):
-    def parse(self, value):
+    def parse(self, value, **kwargs):
         return parse_window_matching(json.dumps(value), {"id": "w0"},
-                                     matching_observation()["candidate_checks"], [0, 1, 2], candidate_frames([0, 1, 2]))
+                                     matching_observation()["candidate_checks"], [0, 1, 2], candidate_frames([0, 1, 2]),
+                                     **kwargs)
+
+    def test_cleanup_removes_valid_extras_with_audit_and_preserves_required_bindings(self):
+        for no_experts in (True, False):
+            with self.subTest(no_experts=no_experts):
+                value = window_matching()
+                if no_experts:
+                    value["checks"][0]["experts"] = []
+                else:
+                    value["bindings"].append(dict(value["bindings"][0], frame_id=1, candidate_id="f1:d0"))
+                before = copy.deepcopy(value)
+                audit = []
+                result = self.parse(value, cleanup_audit=audit)
+                expected = [] if no_experts else window_matching()["bindings"]
+                self.assertEqual(result["bindings"], expected)
+                self.assertEqual(result["checks"], before["checks"])
+                self.assertEqual(value, before)
+                self.assertEqual(audit[0]["warning"], "unused_bindings_removed")
+                self.assertEqual(audit[0]["window_id"], "w0")
+                self.assertEqual(audit[0]["original_count"], len(before["bindings"]))
+                self.assertEqual(audit[0]["retained_count"], len(expected))
+                self.assertEqual(audit[0]["removed_bindings"], before["bindings"] if no_experts else before["bindings"][-1:])
+                # The normalized response must pass the downstream strict contract.
+                self.assertEqual(self.parse(result), result)
+
+    def test_cleanup_does_not_repair_missing_duplicate_or_invalid_bindings(self):
+        for mode in ("missing", "duplicate", "invalid_required", "invalid_extra", "same_relative_candidate"):
+            with self.subTest(mode=mode):
+                value = window_matching()
+                value["bindings"].append(dict(value["bindings"][0], frame_id=1, candidate_id="f1:d0"))
+                if mode == "missing": value["bindings"].pop(0)
+                elif mode == "duplicate": value["bindings"].append(copy.deepcopy(value["bindings"][0]))
+                elif mode == "invalid_required": value["bindings"][0]["candidate_id"] = "f0:d999"
+                elif mode == "invalid_extra": value["bindings"][-1]["candidate_id"] = "f1:d999"
+                else:
+                    value["checks"][0]["experts"][1].update(motion_mode="relative", reference_entity_key="bowl")
+                    value["bindings"][1]["candidate_id"] = "f0:d0"
+                audit = []
+                with self.assertRaises(ValueError): self.parse(value, cleanup_audit=audit)
+                self.assertEqual(audit, [])
+
+    def test_cleanup_leaves_valid_empty_and_shared_bindings_unchanged(self):
+        for no_experts in (True, False):
+            with self.subTest(no_experts=no_experts):
+                value = window_matching()
+                if no_experts:
+                    value["checks"][0]["experts"] = []
+                    value["bindings"] = []
+                audit = []
+                self.assertEqual(self.parse(value, cleanup_audit=audit), value)
+                self.assertEqual(audit, [])
+
+    def test_empty_frames_fill_only_required_omissions_and_preserve_model_bindings(self):
+        value = window_matching()
+        supplied = copy.deepcopy(value["bindings"][:2])
+        value["bindings"] = supplied
+        frames = candidate_frames([0, 1]) + candidate_frames([2], empty=True)
+        audit = []
+        result = parse_window_matching(json.dumps(value), {"id": "w0"}, matching_observation()["candidate_checks"],
+                                       [0, 1, 2], frames, cleanup_audit=audit)
+        self.assertEqual(result["bindings"][:2], supplied)
+        self.assertEqual(result["checks"], value["checks"])
+        self.assertEqual([(b["entity_key"], b["frame_id"], b["status"], b["candidate_id"])
+                          for b in result["bindings"][2:]], [("apple", 2, "missing", None), ("bowl", 2, "missing", None)])
+        self.assertEqual(audit[0]["evidence"], [{"frame_id": 2, "status": "no_detections", "candidate_count": 0}])
+        self.assertEqual(audit[0]["added_bindings"], result["bindings"][2:])
+        self.assertEqual(parse_window_matching(json.dumps(result), {"id": "w0"}, matching_observation()["candidate_checks"],
+                                               [0, 1, 2], frames), result)
+
+    def test_empty_frame_repairs_are_atomic_and_do_not_relax_invalid_inputs(self):
+        for mode in ("strict", "nonempty", "absent_inventory", "duplicate", "invalid_candidate", "bad_status"):
+            with self.subTest(mode=mode):
+                value = window_matching()
+                value["bindings"] = []
+                frames = candidate_frames([0, 1, 2], empty=True)
+                if mode == "nonempty": frames[2] = candidate_frames([2])[0]
+                elif mode == "absent_inventory": frames.pop()
+                elif mode == "duplicate":
+                    binding = {"entity_key": "apple", "frame_id": 0, "status": "missing", "candidate_id": None, "reason": "No detections."}
+                    value["bindings"] = [binding, dict(binding)]
+                elif mode == "invalid_candidate": value["bindings"] = window_matching()["bindings"][:1]
+                elif mode == "bad_status": frames[2]["status"] = "candidates"
+                audit = []
+                with self.assertRaises(ValueError):
+                    parse_window_matching(json.dumps(value), {"id": "w0"}, matching_observation()["candidate_checks"],
+                                          [0, 1, 2], frames, cleanup_audit=None if mode == "strict" else audit)
+                self.assertEqual(audit, [])
+
+    def test_motion_repairs_only_first_frame_and_deduplicates_shared_requirements(self):
+        obs = matching_observation()
+        obs["candidate_checks"][1]["entity_keys"] = ["apple", "bowl"]
+        value = window_matching()
+        motion = value["checks"][0]["experts"][1]
+        motion.update(motion_mode="relative", reference_entity_key="bowl")
+        value["checks"][0]["experts"] = [motion]
+        value["checks"][1].update(relevance="related", experts=[copy.deepcopy(motion)])
+        value["bindings"] = []
+        audit = []
+        result = parse_window_matching(json.dumps(value), {"id": "w0"}, obs["candidate_checks"], [0, 1, 2],
+                                       candidate_frames([0], empty=True) + candidate_frames([1, 2]), cleanup_audit=audit)
+        self.assertEqual([(b["entity_key"], b["frame_id"]) for b in result["bindings"]], [("apple", 0), ("bowl", 0)])
+        self.assertEqual(len(audit[0]["added_bindings"]), 2)
+
+    def test_empty_frame_additions_and_unused_removals_share_one_normalized_response(self):
+        value = window_matching()
+        value["bindings"] = [{"entity_key": "apple", "frame_id": 1, "status": "missing", "candidate_id": None,
+                              "reason": "No detections."}]
+        audit = []
+        result = parse_window_matching(json.dumps(value), {"id": "w0"}, matching_observation()["candidate_checks"],
+                                       [0, 1, 2], candidate_frames([0, 1, 2], empty=True), cleanup_audit=audit)
+        self.assertEqual(len(result["bindings"]), 4)
+        self.assertEqual([event["warning"] for event in audit],
+                         ["unused_bindings_removed", "missing_bindings_added_for_empty_frames"])
+        self.assertEqual(audit[0]["removed_bindings"], value["bindings"])
+        self.assertEqual(len(audit[1]["added_bindings"]), 4)
 
     def test_preserves_complete_checklist_and_proposals_without_completion_verdicts(self):
         value = window_matching()

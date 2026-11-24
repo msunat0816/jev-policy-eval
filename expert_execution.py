@@ -8,7 +8,9 @@ import cv2
 from experts import MaskSeed, ShortWindowMotionExpert, VideoFrame
 from experts.geometry import pairwise_spatial_evidence
 from experts.masks import decode_mask
-from vlm_matching import (EMPTY_CANDIDATE_BINDING_METHOD, MATCHING_MODEL, MATCHING_PROTOCOL, parse_window_matching,
+from vlm_matching import (BINDING_COMPLETION_PROTOCOL, COMPLETION_BINDING_METHOD, UNRESOLVED_BINDING_METHOD,
+                          EMPTY_CANDIDATE_BINDING_METHOD, MATCHING_MODEL, MATCHING_PROTOCOL, parse_window_matching,
+                          required_binding_pairs,
                           validate_candidate_inputs, validate_matching_inputs)
 
 
@@ -58,8 +60,14 @@ def validate_execution_inputs(task, obs, selection, times, candidates, matching)
         raw_bindings = []
         fields = ("entity_key", "frame_id", "status", "candidate_id", "reason")
         for binding in bindings:
-            if not isinstance(binding, dict):
+            if not isinstance(binding, dict) or set(binding) != {*fields, "pts_seconds", "source"}:
                 raise ValueError("execution: invalid binding PTS/source reference")
+            raw_bindings.append({field: binding[field] for field in fields})
+        raw = {"window_id": record["window_id"], "checks": record.get("checks"), "bindings": raw_bindings}
+        parse_window_matching(json.dumps(raw, allow_nan=False), window, obs["candidate_checks"],
+                              ids, [by_frame[i] for i in ids], allow_unresolved=True)
+        requested = validate_binding_completion(record, window, by_frame)
+        for binding in bindings:
             binding_source = expected_source
             frame_id = binding.get("frame_id")
             frame = by_frame.get(frame_id) if type(frame_id) is int else None
@@ -68,19 +76,56 @@ def validate_execution_inputs(task, obs, selection, times, candidates, matching)
                     and isinstance(binding.get("source"), dict)
                     and binding["source"].get("method") == EMPTY_CANDIDATE_BINDING_METHOD):
                 binding_source = {**expected_source, "method": EMPTY_CANDIDATE_BINDING_METHOD, "model": None}
+            key = (binding["entity_key"], binding["frame_id"])
+            if key in requested:
+                unresolved = binding["status"] == "unresolved"
+                binding_source = {**expected_source,
+                                  "method": UNRESOLVED_BINDING_METHOD if unresolved else COMPLETION_BINDING_METHOD,
+                                  "model": None if unresolved else MATCHING_MODEL,
+                                  "request_file": record["binding_completion"]["request_file"]}
+            elif binding["status"] == "unresolved":
+                raise ValueError("execution: unresolved binding requires a completion attempt")
             if (not isinstance(binding, dict) or set(binding) != {*fields, "pts_seconds", "source"}
                     or type(binding.get("frame_id")) is not int or binding["frame_id"] not in ids
                     or type(binding.get("pts_seconds")) not in (int, float)
                     or binding["pts_seconds"] != times[binding["frame_id"]]
                     or binding.get("source") != binding_source):
                 raise ValueError("execution: invalid binding PTS/source reference")
-            raw_bindings.append({field: binding[field] for field in fields})
-        raw = {"window_id": record["window_id"], "checks": record.get("checks"), "bindings": raw_bindings}
-        # Reuse exactly the matching contract: checks, experts, roles, candidate IDs,
-        # required binding keys and continuous in-window motion frame references.
-        parse_window_matching(json.dumps(raw, allow_nan=False), window, obs["candidate_checks"],
-                              ids, [by_frame[i] for i in ids])
     return by_frame
+
+
+def validate_binding_completion(record, window, by_frame):
+    completion = record.get("binding_completion")
+    if completion is None:
+        return set()
+    fields = {"protocol", "required_pairs", "requested_pairs", "unresolved_pairs", "request_file", "error", "status"}
+    if (not isinstance(completion, dict) or set(completion) != fields
+            or completion["protocol"] != BINDING_COMPLETION_PROTOCOL
+            or completion["request_file"] != f"03-bind-{window['id']}.json"):
+        raise ValueError("execution: invalid binding completion protocol/source")
+    pairs = {}
+    for field in ("required_pairs", "requested_pairs", "unresolved_pairs"):
+        value = completion[field]
+        if (not isinstance(value, list) or any(not isinstance(pair, list) or len(pair) != 2
+                or not isinstance(pair[0], str) or type(pair[1]) is not int for pair in value)):
+            raise ValueError("execution: invalid completion binding slots")
+        pairs[field] = {tuple(pair) for pair in value}
+        if len(pairs[field]) != len(value):
+            raise ValueError("execution: duplicate completion binding slots")
+    required, requested, unresolved = (pairs[key] for key in ("required_pairs", "requested_pairs", "unresolved_pairs"))
+    actual_unresolved = {(b["entity_key"], b["frame_id"]) for b in record["bindings"] if b["status"] == "unresolved"}
+    status = "completed" if not unresolved else "unresolved" if unresolved == requested else "partial"
+    if (required != set(required_binding_pairs(record["checks"])) or not requested or not requested <= required
+            or not unresolved <= requested or unresolved != actual_unresolved or completion["status"] != status
+            or any(not by_frame[frame]["candidates"] for _, frame in requested)):
+        raise ValueError("execution: completion slots/status differ from proposals or bindings")
+    error = completion["error"]
+    if error is not None and (not isinstance(error, dict) or set(error) != {"kind", "error_type", "error"}
+            or error["kind"] not in ("invalid_response", "transport_error")
+            or any(not isinstance(error[key], str) or not error[key] for key in ("error_type", "error"))
+            or unresolved != requested):
+        raise ValueError("execution: invalid completion failure record")
+    return requested
 
 
 def _status(statuses):
@@ -203,7 +248,13 @@ def execute_proposals(task, obs, selection, times, cap, candidates, matching):
                           "source": {"matching_file": MATCHING_FILE,
                                      "window_matching_file": f"03-matching-{window['window_id']}.json",
                                      "request_file": window["request_file"], "candidate_file": CANDIDATE_FILE}}
-                if spatial:
+                unresolved = [b for b in record["bindings"] if b["status"] == "unresolved"]
+                if unresolved:
+                    record.update(execution_status="not_executed", status="missing", reason="binding_unresolved", result=None,
+                                  missing=[{"entity_key": b["entity_key"], "frame_id": b["frame_id"],
+                                            "pts_seconds": b["pts_seconds"], "candidate_id": None,
+                                            "reason": "binding_unresolved", "binding_reason": b["reason"]} for b in unresolved])
+                elif spatial:
                     result = _spatial(proposal, bindings, by_frame)
                     record.update(execution_status="executed", status=result["status"], reason=None, result=result)
                 else:

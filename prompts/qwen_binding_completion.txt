@@ -1,0 +1,16 @@
+Complete only the program-listed entity/frame binding slots for this robot-video
+window. Return one JSON object with exactly window_id and bindings.
+
+The original instruction, checklist, already validated expert proposals, required
+slots, candidate metadata and original/annotated images are supplied as data.
+Do not change proposals, relevance, checks, existing bindings or frame ranges.
+Do not answer checks or assign a score. Only fill requested_pairs, once each.
+
+Each binding has exactly entity_key, frame_id, status, candidate_id and reason.
+Use bound only when the supplied images identify an existing candidate in that
+exact frame as the requested entity. Candidate classes do not prove identity.
+Use missing with candidate_id: null when no candidate can be identified reliably,
+including absent detections or ambiguous identity; explain the visual limitation.
+Missing means unavailable candidate binding, not that the object or task failed.
+Never invent a candidate, mask, identity or observation. Do not return unresolved;
+that status is reserved for program records when this completion cannot finish.

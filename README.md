@@ -47,7 +47,7 @@
 - 模型：`qwen3.8-flash`，OpenAI 兼容 Chat Completions，`enable_thinking=false`；JEV 为 `jev-1.14.0`。
 - 采样仍从第一帧原始 PTS 开始，每 2 秒取每个非空时间段的第一帧，额外保留末帧，按原帧号去重，无 8 帧上限。沿用 `--sample-interval-seconds`。
 - 选窗请求与输出契约：[window_selection.py](window_selection.py)，协议 `jev-window-selection-v2`；入口调用 `select_windows()`，替换旧 `route()`。
-- VLM 匹配契约与校验：[vlm_matching.py](vlm_matching.py)，协议 `vlm-window-check-expert-bindings-v2`；独立 prompt 为 [prompts/qwen_window_matching.txt](prompts/qwen_window_matching.txt)，入口在候选生成后调用 `match_windows()`，保存绑定后交给 `execute_experts()`。
+- VLM 匹配契约与校验：[vlm_matching.py](vlm_matching.py)，协议 `vlm-window-check-expert-bindings-v3`；独立 prompt 为 [prompts/qwen_window_matching.txt](prompts/qwen_window_matching.txt)，入口在候选生成后调用 `match_windows()`，保存绑定后交给 `execute_experts()`。
 
 | 输出数组 | 每项字段 |
 |---|---|
@@ -89,11 +89,14 @@ python evaluate_rollout.py --video "$ROLLOUT_VIDEO" --task "$ROLLOUT_TASK" \
 1. 模型仍为 `MATCHING_MODEL=qwen3.8-flash`、非思考模式、JSON 输出，每个选中窗口一次请求。沿用 DashScope 密钥/base URL 解析方式，不修改粗观察、选窗或两个 expert 算法。输入为原 instruction、全部 requirements、完整 checklist、当前窗口原 ID/范围、expert 能力和已有候选。空选择保存空匹配汇总，不读图片、不调用匹配 API。
 2. `candidate_presentation.py` 在原图副本上画框、mask 轮廓、完整 `f帧号:d编号`，并添加类别/分数/mask 状态侧栏；每帧单独提供原图和候选图。连续原帧和 PTS 完整保留，不裁剪、不重新分割。图片保存为 `matching_frames/<window_id>/<frame_id>.jpg` 与 `<frame_id>-candidates.jpg`；有效匹配记录中的 `images` 保存确切文件/帧/PTS 对应。候选元数据不包含长 RLE 数组，完整 mask 仍保存在第 2 步文件。
 3. 调用前验证完整选窗/checklist/PTS 边界，并校验候选覆盖所有已选原帧且无重复，窗口映射、帧内编号、候选帧号/PTS、原始像素框、mask 尺寸/RLE/状态相符。实际解码图片尺寸也须与候选一致。非法输入在对应请求前报错；不填补或重新检测候选。
-4. 响应协议升级为 `vlm-window-check-expert-bindings-v2`，严格返回 `window_id, checks, bindings`。每个 check 恰有一条 `check_id, relevance, reason, experts, limitations`，相关性仍为 `related/unrelated/uncertain`。不相关项无 expert；相关但无 expert 覆盖或相关性不确定时须解释限制。禁止新增/遗漏 check、旧工具名及答案/评分字段。
+4. 响应协议升级为 `vlm-window-check-expert-bindings-v3`，严格返回 `window_id, checks, bindings`。每个 check 恰有一条 `check_id, relevance, reason, experts, limitations`，相关性仍为 `related/unrelated/uncertain`。不相关项无 expert；相关但无 expert 覆盖或相关性不确定时须解释限制。禁止新增/遗漏 check、旧工具名及答案/评分字段。
 5. 窗口级 `bindings` 每项严格为 `entity_key, frame_id, status, candidate_id, reason`。`bound` 必须引用该帧真实存在的候选；找不到或身份不明时为 `missing`、`candidate_id=null` 且原因非空。同一 `(entity_key, frame_id)` 只出现一次，跨 check 复用；不凭类别或帧内编号建立跨帧身份。空 mask 不禁止清楚的对象身份绑定，但也不因此获得可靠运动 seed。
 6. `object_spatial` 提议字段为 `expert_id, entity_keys, frame_ids, reason`，只提议使用已生成候选。`short_window_motion` 提议字段为 `expert_id, target_entity_key, reference_entity_key, motion_mode, frame_ids, reason`：绝对模式参考为 null；相对模式须有明确、不同的参考实体，双方不得绑定同一候选。实体须来自当前 check，运动至少两帧且连续，目标/参考角色不明确时不猜测、不提出不完整角色提议。角色明确但 seed 绑定缺失时保留提议及缺失原因。
 7. 只要求提议必需的绑定：空间提议的每个实体×每个帧；运动提议仅需首帧目标及相对模式的参考实体。必须恰好覆盖这些绑定键，不额外要求逐帧跟踪身份，也不接受重复或无用途的绑定。程序在保存记录时补充 PTS 及来源（匹配模型、请求 trace、`03-yolo-candidates.json`），不把模型理由写成已执行的工具证据。
-8. 原始 trace、逐窗口结果与汇总仍分别为 `03-match-<window_id>.json`、`03-matching-<window_id>.json`、`03-window-matching.json`。汇总标记 `proposals_and_bindings_only`。匹配入口会在所有已提供绑定和专家提案均通过校验时，删除未被任何提案使用的多余绑定；对遗漏的必需绑定，仅当对应帧明确为 `no_detections` 且候选列表为空时，程序补齐 `status: missing`、`candidate_id: null`，不推断实体身份或任务结果；全部 `experts` 为空时清理为 `bindings: []`。原始 trace 不变，清理后的结果另存；`03-matching-<window_id>-binding-cleanup.json` 记录警告、删除或新增的完整绑定、空候选依据和规范化后的响应，逐窗口结果通过 `binding_cleanup_file` 引用它，并在日志中输出警告。无清理时不产生该审计文件。有候选或缺少候选记录的帧遗漏绑定，以及重复或非法绑定仍报错。补齐后再次严格校验；程序补齐的绑定来源标记为 `program_empty_candidate_inventory`、`model: null`，下游仅在空候选帧接受此来源，并保持缺失证据状态。下游保存结果仍严格校验，不再自动补齐。非法响应保留已有 trace 和已完成窗口记录，不自动重试或补造结果。`run.json` 记录匹配模型/协议、全帧原图与候选图策略、每窗口一次请求、后续执行已启用；第 4–7 步保存后 `result.json` 返回终评的 `scored` 或 `insufficient_evidence`、分数和各阶段文件引用/计数。
+8. 原始 trace、逐窗口结果与汇总分别为 `03-match-<window_id>.json`、`03-matching-<window_id>.json`、`03-window-matching.json`，原响应不改写。已有的保守清理继续生效：仅删除无用途的合法绑定，仅在明确的空候选帧补 `missing`；清理留档 `03-matching-<window_id>-binding-cleanup.json`。重复绑定、非法候选或不合法专家提案仍直接报错。
+9. **必需绑定遗漏恢复（第 1 项）**：程序根据已校验提案生成去重的必填 `(entity_key, frame_id)` 清单。正常响应完整时无额外调用；剩余遗漏最多触发一次定向视觉补问，仅发送所需帧的原图/候选图和现有上下文。补问 prompt 为 `prompts/qwen_binding_completion.txt`，返回仅含 `window_id, bindings`，不得改变已有绑定、check、相关性或提案。合法的部分补答可以保留；非法补答整体拒绝，不根据最终 score 再试。原请求、补问请求、审计分别留档 `03-match-<window_id>.json`、`03-bind-<window_id>.json`、`03-matching-<window_id>-binding-completion.json`。
+10. 补问后仍未解决的键记录为 `status: unresolved, candidate_id: null`，来源 `program_unresolved_binding, model: null`；这表示漏答未解决，不表示目标不存在。模型明确找不到/身份不清的候选仍是 `missing`；补问获得的绑定来源为 `matching_vlm_binding_completion`。逐窗口 `binding_completion` 保存程序必填清单、补问清单、未解决清单、状态、错误和请求引用；下游严格验证清单、候选、来源和 PTS。空间或运动提案使用了 unresolved 键时，仅该提案记录 `not_executed / missing / binding_unresolved`，不调用测量算法、不制造结果；该窗口相关/不确定的原图继续进入证据包和 JEV。已有明确 `missing` 的处理保持原语义（例如可靠目标仍可做绝对运动）。JEV 保留 `yes/no/unknown` 与最终 `insufficient_evidence`，不会由程序补出 score。
+11. 定向补问计入 API 调用审计和每视频调用预算；不增加其他阶段的网络重试，调用预算、整段超时、解码与存储错误仍可终止运行。`run.json` 记录 v3 匹配协议和补问策略。修改后的 framework 使用新运行目录，保留 validation50-08 原记录。
 
 ## 当前绑定后的 expert 执行（计划第 4 步）
 
@@ -109,7 +112,7 @@ python evaluate_rollout.py --video "$ROLLOUT_VIDEO" --task "$ROLLOUT_TASK" \
 
 1. `evidence_packaging.py::build_evidence_packages()` 对原 checklist 的每个 check 恰好生成一个包，保留原 instruction、该 check 及关联 requirements；不新增/删减 check。仅收集匹配中 relevance 为 `related` 或 `uncertain` 的已选窗口，保留 uncertain、原理由与限制。没有相关窗口也保存空包、`status=no_related_windows` 和原因；没有 expert 的相关 check 仍保留图片，缺测不预先转换成 check 的 unknown。
 2. 收集这些窗口的全部连续原图文件引用，按原始帧号去重、按时间排序，并保留各窗口原图/候选标注图的所有来源；不再抽帧、裁剪、复制或解码图片。记录原帧号/PTS、相对整个视频的图片覆盖/未覆盖区间及是否包含首末帧。覆盖仅表示可供后续读取的图片范围，不声称任何语义要求已全程满足。
-3. 包内绑定保留窗口、实体、原帧/PTS、候选编号、bound/missing、理由和 VLM/请求/候选文件来源；同一帧在不同窗口的绑定分别保存，不用某一条覆盖其他绑定。原始候选、匹配和执行输出不改写。
+3. 包内绑定保留窗口、实体、原帧/PTS、候选编号、bound/missing/unresolved、理由和 VLM/请求/候选文件来源；同一帧在不同窗口的绑定分别保存，不用某一条覆盖其他绑定。原始候选、匹配和执行输出不改写。
 4. 几何按每次执行、每个实体对、每个既有测量分别计算最小、最大、最后有效值，记录单位、对应帧/PTS与有效/缺测区间。极值相同时选最早出现帧。空间提议可只含离散帧，摘要明确 `proposed_frames_only_no_interpolation`；不会据此声称中间帧都被测量。单实体仍有绑定覆盖记录；空 mask 保留框测量，mask 测量摘要为空。
 5. 运动分别对目标、实际参考和提议的相对运动整理首个/最后有效 from-seed 位移、最大 from-seed 位移（含向量/像素模长/图像方向及对应帧/PTS）、有效/缺测区间、最后一帧是否有测量、缺失原因和原始 interruptions。不同执行的 seed 起点分别保留，不拼接、不重置起点、不把特征点位移称为中心轨迹；不计算未经确认的速度、路径长度或“放稳”阈值。参考缺失时保留目标绝对摘要，相对摘要明确缺测；目标 mask 缺失时保留未执行记录。
 6. 原始逐帧 `samples`、mask/RLE 和几何数组均不放入测量摘要；通过 `raw_result_ref={file,record_id}` 回溯 `04-expert-execution.json`。提议帧列表压缩为连续帧区间。每条摘要继续关联执行 ID、窗口、expert、实体与来源。这些材料现交给下面的第 6 步；第 5 步自身只构造材料。

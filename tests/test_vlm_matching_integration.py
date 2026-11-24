@@ -43,6 +43,79 @@ class FrameCapture:
 
 @unittest.skipIf(ev is None, "OpenCV and NumPy required for video/image integration")
 class VlmMatchingIntegrationTests(unittest.TestCase):
+    def test_empty_candidate_repairs_are_audited_and_execute_as_missing_evidence(self):
+        selection = summarize_selection([(0, 2), (2, 4)], {"w0": "p2", "w1": "p1"})
+        times = [i/10 for i in range(5)]
+        candidates = candidate_bundle(selection, times, empty=True)
+        value = window_matching()
+        value["bindings"] = []
+        response = qwen_response(value)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}), \
+                    patch.object(ev, "urlopen", return_value=io.BytesIO(json.dumps(response).encode())) as http, \
+                    self.assertLogs("evaluate_rollout", level="WARNING") as logs:
+                result = ev.match_windows("Task", matching_observation(), selection, times,
+                                          FrameCapture(), folder, candidates)
+            http.assert_called_once()
+            self.assertIn("added 4 missing bindings", logs.output[0])
+            trace = json.loads((folder / "03-match-w0.json").read_text())
+            self.assertEqual(trace["response"], response)
+            window = result["windows"][0]
+            audit = json.loads((folder / window["binding_cleanup_file"]).read_text())
+            self.assertEqual(audit["candidate_file"], "03-yolo-candidates.json")
+            self.assertEqual(audit["warnings"][0]["method"], "program_empty_candidate_inventory")
+            self.assertEqual(len(audit["warnings"][0]["added_bindings"]), 4)
+            self.assertEqual(audit["warnings"][0]["evidence"], [
+                {"frame_id": f, "status": "no_detections", "candidate_count": 0} for f in (0, 2)])
+            self.assertEqual(audit["normalized_response"]["checks"], value["checks"])
+            self.assertEqual(json.loads((folder / "03-matching-w0.json").read_text()), window)
+            self.assertTrue(all(b["source"]["method"] == "program_empty_candidate_inventory"
+                                and b["source"]["model"] is None for b in window["bindings"]))
+            from expert_execution import execute_proposals
+            cap = FrameCapture()
+            with patch("expert_execution.ShortWindowMotionExpert") as motion:
+                execution = execute_proposals("Task", matching_observation(), selection, times, cap, candidates, result)
+            motion.assert_not_called()
+            self.assertEqual(cap.read_indices, [])
+            self.assertTrue(all(r["status"] == "missing" for r in execution["records"]))
+
+    def test_cleanup_preserves_raw_http_trace_and_saves_normalized_response_and_warning(self):
+        import copy
+        selection = summarize_selection([(0, 2), (2, 4)], {"w0": "p2", "w1": "p1"})
+        times = [i/10 for i in range(5)]
+        for no_experts in (True, False):
+            with self.subTest(no_experts=no_experts), tempfile.TemporaryDirectory() as tmp:
+                value = window_matching()
+                if no_experts:
+                    value["checks"][0]["experts"] = []
+                else:
+                    value["bindings"].append(dict(value["bindings"][0], frame_id=1, candidate_id="f1:d0"))
+                before = copy.deepcopy(value)
+                response = qwen_response(value)
+                folder = Path(tmp)
+                with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}), \
+                        patch.object(ev, "urlopen", return_value=io.BytesIO(json.dumps(response).encode())) as http, \
+                        self.assertLogs("evaluate_rollout", level="WARNING") as logs:
+                    result = ev.match_windows("Task", matching_observation(), selection, times,
+                                              FrameCapture(), folder, candidate_bundle(selection, times))
+                http.assert_called_once()
+                self.assertIn("unused bindings", logs.output[0])
+                trace = json.loads((folder / "03-match-w0.json").read_text())
+                self.assertEqual(json.loads(trace["response"]["choices"][0]["message"]["content"]), before)
+                window = result["windows"][0]
+                audit = json.loads((folder / window["binding_cleanup_file"]).read_text())
+                self.assertEqual(audit["request_file"], "03-match-w0.json")
+                self.assertEqual(audit["warnings"][0]["removed_bindings"], before["bindings"] if no_experts else before["bindings"][-1:])
+                self.assertEqual(audit["normalized_response"]["checks"], before["checks"])
+                self.assertEqual(len(audit["normalized_response"]["bindings"]), 0 if no_experts else 4)
+                self.assertEqual(len(window["bindings"]), 0 if no_experts else 4)
+                self.assertEqual(json.loads((folder / "03-matching-w0.json").read_text()), window)
+                # Cleaned output is accepted by the strict execution-stage boundary.
+                from expert_execution import validate_execution_inputs
+                validate_execution_inputs("Task", matching_observation(), selection, times,
+                                          candidate_bundle(selection, times), result)
+
     def test_each_selected_window_gets_its_continuous_frames_full_checklist_and_model(self):
         obs = matching_observation()
         obs["frames"].append(dict(obs["frames"][-1], frame=6))
@@ -75,6 +148,7 @@ class VlmMatchingIntegrationTests(unittest.TestCase):
                 self.assertEqual(sum(part["type"] == "image_url" for part in parts), 2 * len(frame_ids))
                 self.assertTrue(all((folder / f"matching_frames/{window_id}/{i}.jpg").exists() for i in frame_ids))
                 self.assertTrue((folder / f"03-matching-{window_id}.json").exists())
+                self.assertFalse((folder / f"03-matching-{window_id}-binding-cleanup.json").exists())
                 self.assertTrue(all((folder / f"matching_frames/{window_id}/{i}-candidates.jpg").exists() for i in frame_ids))
             self.assertFalse((folder / "matching_frames/w1").exists())
             self.assertEqual([w["window_id"] for w in result["windows"]], ["w0", "w2"])
